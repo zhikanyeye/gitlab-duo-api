@@ -513,14 +513,20 @@
       </div>
       <div class="brw-side">
         <div class="hint-box">
-          <b>使用说明</b><br>
-          1. 在左侧画面里点击 GitLab 的用户名/密码输入框<br>
-          2. 在下方「输入文本」框打字，点「发送」填入<br>
-          3. 点击「Sign in」按钮登录<br>
-          4. 登录成功后下方会出现「保存到账号池」
+          <b>使用方法</b><br>
+          <b>方式一（推荐）</b>：在下方直接输入 GitLab 账号密码，点「登录」<br>
+          <b>方式二</b>：在左侧画面里手动操作表单
         </div>
 
-        <h4>输入文本</h4>
+        <h4>快捷登录（绕过 Cloudflare）</h4>
+        <div class="field" style="margin-bottom:8px;">
+          <input id="brwLoginUser" class="input" placeholder="GitLab 用户名 / 邮箱" style="margin-bottom:6px;">
+          <input id="brwLoginPass" class="input" type="password" placeholder="GitLab 密码" style="margin-bottom:6px;">
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;margin-bottom:12px;" id="brwLoginBtn" onclick="brwDoLogin()">登 录</button>
+        <div id="brwLoginErr" style="font-size:12px;color:var(--danger);margin-bottom:8px;display:none;"></div>
+
+        <h4>输入文本（手动模式）</h4>
         <div class="brw-input-row">
           <input id="brwTextInput" class="input" placeholder="输入文字后点发送" onkeydown="if(event.key==='Enter'){brwSendText();}">
           <button class="btn btn-primary btn-sm" onclick="brwSendText()">发送</button>
@@ -965,6 +971,11 @@ async function openBrowserLogin() {
   document.getElementById('brwLoginBanner').classList.remove('show');
   document.getElementById('brwSaveForm').classList.remove('show');
   document.getElementById('brwAccName').value = '';
+  document.getElementById('brwLoginUser').value = '';
+  document.getElementById('brwLoginPass').value = '';
+  document.getElementById('brwLoginErr').style.display = 'none';
+  document.getElementById('brwLoginBtn').disabled = false;
+  document.getElementById('brwLoginBtn').textContent = '登 录';
   setStatus('connecting', '连接中…');
 
   // check playwright availability + create session intent
@@ -1016,6 +1027,19 @@ async function openBrowserLogin() {
     } else if (m.type === 'error') {
       setStatus('error', m.message || '错误');
       toast('浏览器错误: ' + (m.message||''), 'error');
+    } else if (m.type === 'login_result') {
+      if (m.ok) {
+        setStatus('win', '已登录');
+        document.getElementById('brwLoginBanner').classList.add('show');
+        document.getElementById('brwSaveForm').classList.add('show');
+        document.getElementById('brwLoginErr').style.display = 'none';
+        toast('登录成功！', 'success');
+      } else {
+        document.getElementById('brwLoginErr').textContent = m.error || '登录失败';
+        document.getElementById('brwLoginErr').style.display = 'block';
+        document.getElementById('brwLoginBtn').disabled = false;
+        document.getElementById('brwLoginBtn').textContent = '登 录';
+      }
     }
   };
   brwWS.onerror = () => { setStatus('error', '连接错误'); };
@@ -1066,6 +1090,17 @@ function brwScroll(dx, dy) {
 function brwReload() {
   if (!brwWS || brwWS.readyState !== 1) return;
   brwWS.send(JSON.stringify({ type:'reload' }));
+}
+
+async function brwDoLogin() {
+  if (!brwWS || brwWS.readyState !== 1) { toast('连接已断开', 'error'); return; }
+  const user = document.getElementById('brwLoginUser').value.trim();
+  const pass = document.getElementById('brwLoginPass').value.trim();
+  if (!user || !pass) { document.getElementById('brwLoginErr').textContent='请输入用户名和密码'; document.getElementById('brwLoginErr').style.display='block'; return; }
+  const btn = document.getElementById('brwLoginBtn');
+  btn.disabled = true; btn.textContent = '登录中…';
+  document.getElementById('brwLoginErr').style.display = 'none';
+  brwWS.send(JSON.stringify({type:'login', username: user, password: pass}));
 }
 
 async function brwSaveAccount() {

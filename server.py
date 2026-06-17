@@ -1576,6 +1576,13 @@ async def assist_ws(ws: WebSocket, token: str = ""):
                 await sess.goto(msg.get("url", ""))
             elif mtype == "reload":
                 await sess.reload()
+            elif mtype == "login":
+                # 用 httpx 直接 POST 登录（绕过 CF），成功后 cookie 注入浏览器
+                result = await sess.login_via_httpx(
+                    username=msg.get("username", ""),
+                    password=msg.get("password", ""),
+                )
+                await ws.send_json({"type": "login_result", **result})
             elif mtype == "close":
                 break
     except WebSocketDisconnect:
