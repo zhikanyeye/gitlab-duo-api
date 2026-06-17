@@ -159,125 +159,155 @@ class BrowserLoginSession:
 
     async def login_via_httpx(self, username: str, password: str) -> Dict:
         """
-        用 httpx 直接 POST GitLab 登录表单（绕过 Playwright 浏览器的 CF 挑战）。
-        成功后将 cookie 注入 Playwright context 并导航到 dashboard。
+        用 httpx Session 模拟完整登录流程：
+        先 GET 登录页获取 CSRF + Cloudflare clearance，
+        再 POST 表单，最后把获得的 session cookie 注入 Playwright。
         返回 {"ok": True} 或 {"ok": False, "error": "..."}
         """
         import httpx
+        import urllib.parse
 
         if not self.page or not self._context:
             return {"ok": False, "error": "页面未就绪"}
 
         try:
-            # 1. 从页面读取 CSRF token
-            csrf = ""
-            try:
-                csrf = await self.page.evaluate(
-                    "() => (document.querySelector('meta[name=csrf-token]')||{}).content || ''"
-                )
-            except Exception:
-                pass
+            # 从 Playwright 浏览器拿已有的 Cloudflare cookies (cf_clearance 等)
+            ctx_cookies = await self._context.cookies() if self._context else []
+            cf_cookies: Dict[str, str] = {}
+            for c in ctx_cookies:
+                cf_cookies[c["name"]] = c["value"]
 
-            if not csrf:
-                # 尝试从已有 cookies 里找
-                cookies = await self._context.cookies()
-                for c in cookies:
-                    if c.get("name") == "csrf_token":
-                        csrf = c.get("value", "")
-                        break
+            sign_in_url = self.base_url + GITLAB_SIGN_IN_PATH
 
-            # 2. 读取当前页面 cookies（含 cf_clearance）
-            cookie_str = await self.get_cookies_str()
+            # --- httpx Session: 自动管理 cookies ---
+            async with httpx.AsyncClient(
+                timeout=30, follow_redirects=False, verify=False,
+            ) as cl:
 
-            # 3. 构建请求（模拟真实浏览器）
-            from urllib.parse import urlparse
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Origin": self.base_url,
-                "Referer": self.base_url + GITLAB_SIGN_IN_PATH,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                "Cookie": cookie_str,
-            }
-            if csrf:
-                headers["X-Csrf-Token"] = csrf
+                # Step 1: GET 登录页，获取 CSRF token + cf_clearance
+                get_headers = {
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                }
+                # 预注入 Playwright 已有的 Cloudflare cookies
+                get_resp = await cl.get(sign_in_url, headers=get_headers)
 
-            # authenticity_token (GitLab 的 CSRF 表单字段)
-            auth_token = ""
-            try:
-                auth_token = await self.page.evaluate(
-                    '() => (document.querySelector("input[name=authenticity_token]")||{}).value || ""'
-                )
-            except Exception:
-                pass
+                # 如果被 CF 拦截(429/403/503)，尝试从响应提取 cf_clearance
+                if get_resp.status_code in (429, 403, 503):
+                    # 手动注入浏览器里的 CF cookies
+                    for name, value in cf_cookies.items():
+                        if name.startswith("cf_") or name.startswith("_cf"):
+                            cl.cookies.set(name, value, domain="gitlab.com")
+                    # 重试 GET
+                    get_resp = await cl.get(sign_in_url, headers=get_headers)
 
-            body_parts = [
-                ("user[login]", username),
-                ("user[password]", password),
-            ]
-            if auth_token:
-                body_parts.insert(0, ("authenticity_token", auth_token))
+                page_html = get_resp.text
 
-            import urllib.parse
-            body_str = urllib.parse.urlencode(body_parts)
+                # 提取 authenticity_token
+                import re
+                auth_token = ""
+                m = re.search(r'name="authenticity_token"[^>]*value="([^"]+)"', page_html)
+                if m:
+                    auth_token = m.group(1)
 
-            # 4. POST 登录
-            async with httpx.AsyncClient(timeout=30, follow_redirects=False, verify=False) as cl:
-                resp = await cl.post(
-                    self.base_url + GITLAB_SIGN_IN_PATH,
-                    content=body_str,
-                    headers=headers,
-                )
+                # 提取 CSRF token
+                csrf = ""
+                m = re.search(r'name="csrf-token"[^>]*content="([^"]+)"', page_html)
+                if m:
+                    csrf = m.group(1)
 
-            # 5. 检查是否登录成功 (302 到 dashboard 或 set _gitlab_session)
-            if resp.status_code in (302, 303, 301):
-                # 提取 set-cookie
-                new_cookies = resp.headers.get_list("set-cookie")
-                # 将响应 cookie 注入 Playwright
-                for h in resp.headers.get_list("set-cookie"):
-                    for part in h.split(","):
-                        part = part.strip()
-                        if "=" in part and "path=" not in part.lower() and "domain=" not in part.lower():
-                            n, _, v = part.split("=", 1)
-                            n = n.strip()
-                            v = v.split(";")[0].strip() if ";" in v else v.strip()
-                            if n and v:
-                                try:
-                                    domain = "." + urlparse(self.base_url).hostname
-                                    domain = "." + ".".join(domain.lstrip(".").split(".")[-2:])
-                                    await self._context.add_cookies([{
-                                        "name": n, "value": v,
-                                        "domain": domain, "path": "/",
-                                        "httpOnly": "HttpOnly" in h,
-                                        "secure": True,
-                                        "sameSite": "Lax",
-                                    }])
-                                except Exception:
-                                    pass
+                if not auth_token and not csrf:
+                    # 可能在 CF 挑战页
+                    if "Just a moment" in page_html or "请稍候" in page_html:
+                        return {"ok": False, "error": "Cloudflare 拦截了登录请求，请等待几秒后重试"}
+                    return {"ok": False, "error": "无法获取登录表单 token（可能被拦截）"}
 
-                # 导航到 dashboard 验证
-                await self.page.goto(self.base_url + "/dashboard/home",
-                                     wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)
+                # Step 2: POST 登录
+                post_headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Origin": self.base_url,
+                    "Referer": sign_in_url,
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                    "X-Csrf-Token": csrf,
+                }
 
-                # 检查是否成功
-                await self._check_login()
-                if self.logged_in:
-                    return {"ok": True}
+                body_parts = [
+                    ("user[login]", username),
+                    ("user[password]", password),
+                ]
+                if auth_token:
+                    body_parts.insert(0, ("authenticity_token", auth_token))
+
+                body_str = urllib.parse.urlencode(body_parts)
+
+                post_resp = await cl.post(sign_in_url, content=body_str, headers=post_headers)
+
+                if post_resp.status_code in (302, 303, 301):
+                    # 登录成功 → 提取 cookie 注入 Playwright
+                    await self._inject_cookies_from_httpx(cl)
+
+                    await self.page.goto(self.base_url + "/dashboard/home",
+                                         wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    await self._check_login()
+
+                    if self.logged_in:
+                        return {"ok": True}
+                    else:
+                        # 还在登录页 → 可能是两步验证
+                        if "/two_factor" in self.page.url or "/2fa" in self.page.url:
+                            return {"ok": False, "error": "需要两步验证，请手动在浏览器中完成"}
+                        return {"ok": False, "error": "登录后未能进入 Dashboard",
+                                "url": self.page.url}
+
+                elif post_resp.status_code == 429:
+                    return {"ok": False, "error": "GitLab 限流 (429)，请 1 分钟后重试"}
+                elif post_resp.status_code == 200:
+                    # 检查是否是错误提示
+                    body_lower = post_resp.text.lower() if post_resp.text else ""
+                    if "invalid login" in body_lower or "invalid email" in body_lower:
+                        return {"ok": False, "error": "用户名或密码错误"}
+                    if "just a moment" in body_lower:
+                        return {"ok": False, "error": "Cloudflare 拦截，请等待几秒后重试"}
+                    return {"ok": False, "error": "登录失败，请检查用户名密码"}
                 else:
-                    return {"ok": False, "error": "登录后未能获取 _gitlab_session cookie",
-                            "url": self.page.url}
-
-            elif resp.status_code == 200 and "sign_in" in str(resp.url):
-                return {"ok": False, "error": "用户名或密码错误"}
-            else:
-                return {"ok": False, "error": f"登录异常 (HTTP {resp.status_code})",
-                        "url": str(resp.url)[:100]}
+                    return {"ok": False, "error": f"登录异常 (HTTP {post_resp.status_code})"}
 
         except Exception as e:
             logger.exception("login_via_httpx error")
             return {"ok": False, "error": str(e)}
+
+    async def _inject_cookies_from_httpx(self, httpx_client) -> None:
+        """将 httpx 客户端的 cookies 注入 Playwright context。"""
+        if not self._context:
+            return
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(self.base_url).hostname or "gitlab.com"
+            domain = "." + ".".join(host.split(".")[-2:])
+
+            cookiejar = httpx_client.cookies
+            new_cookies = []
+            for cookie in cookiejar.jar:
+                if hasattr(cookie, "domain"):
+                    new_cookies.append({
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": domain,
+                        "path": cookie.path or "/",
+                        "httpOnly": getattr(cookie, "has_nonstandard_attr", lambda x: False)("HttpOnly"),
+                        "secure": cookie.secure or False,
+                        "sameSite": "Lax",
+                    })
+
+            if new_cookies:
+                await self._context.add_cookies(new_cookies)
+                logger.info("[login] injected %d cookies from httpx", len(new_cookies))
+        except Exception as e:
+            logger.warning("[login] cookie injection failed: %s", e)
 
     async def stop_screenshot(self) -> None:
         """停止截图循环（pinned 会话不再需要实时截图）。"""
