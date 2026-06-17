@@ -688,6 +688,20 @@ function renderAccounts(accs) {
 }
 
 function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+  }
+  return fallbackCopy(text);
+}
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';
+  document.body.appendChild(ta);
+  ta.select(); ta.setSelectionRange(0, 99999);
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}
 
 /* ---------- Account CRUD ---------- */
 let editCache = {};
@@ -1106,7 +1120,7 @@ async function genApiKey() {
   try {
     const r = await fetchJson('/v1/api-keys', { method:'POST', body: JSON.stringify({name}) });
     const key = r.key;
-    await navigator.clipboard.writeText(key).catch(()=>{});
+    copyToClipboard(key);
     const msg = document.getElementById('modalRoot');
     msg.innerHTML = `<div class="modal-overlay" onclick="this.remove();event.stopPropagation();">
       <div class="modal" onclick="event.stopPropagation()" style="max-width:500px;">
