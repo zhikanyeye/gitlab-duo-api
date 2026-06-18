@@ -60,6 +60,7 @@ from browser_login import BrowserLoginManager, BrowserLoginSession  # noqa: E402
 from chat_driver import get_driver, close_driver  # noqa: E402
 from api_keys import ApiKeyManager  # noqa: E402
 from db import Database, DataManager, make_jwt, verify_jwt  # noqa: E402
+from email_smtp import send_code, verify_code  # noqa: E402
 
 
 # ============================================================
@@ -1037,13 +1038,19 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
         else:
             req_auth = token
 
-    # API key auth: verify key, then use pool (key tracks usage)
-    if is_api_key and api_key_mgr:
-        key_obj = await api_key_mgr.verify(api_key_raw)
-        if not key_obj or not key_obj.enabled:
-            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
-        await api_key_mgr.report_usage(api_key_raw)
-        # Fall through to pool — API key just authenticates, pool handles actual sending
+    # API key auth: check legacy pool keys first, then user-level DB keys
+    if is_api_key:
+        if api_key_mgr:
+            key_obj = await api_key_mgr.verify(api_key_raw)
+            if key_obj and key_obj.enabled:
+                await api_key_mgr.report_usage(api_key_raw)
+        else:
+            # Check user-level DB key
+            db_key = dm.verify_api_key(api_key_raw) if dm else None
+            if not db_key or not db_key["enabled"]:
+                raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+            dm.report_key_usage(api_key_raw)
+        # Fall through to pool
 
     model = req.model or config.default_model
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1832,15 +1839,37 @@ async def responses_endpoint(req: ResponsesRequest, authorization: Optional[str]
 # 用户系统 (多用户注册/登录)
 # ============================================================
 
+@app.post("/v1/auth/send-code")
+async def auth_send_code(request: Request):
+    """发送邮箱验证码。"""
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "valid email required")
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, send_code, email)
+        return {"status": "ok", "message": "验证码已发送"}
+    except Exception as e:
+        raise HTTPException(500, f"发送失败: {e}")
+
+
 @app.post("/v1/auth/register")
 async def auth_register(request: Request):
     body = await request.json()
+    email = (body.get("email") or "").strip()
+    code = (body.get("code") or "").strip()
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
-    if not username or not password:
-        raise HTTPException(400, "username and password required")
+    if not all([email, code, username, password]):
+        raise HTTPException(400, "email, code, username, password required")
     if len(password) < 6:
         raise HTTPException(400, "password too short (min 6)")
+    if not verify_code(email, code):
+        raise HTTPException(400, "invalid or expired verification code")
+    # 不允许用户名含特殊字符
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\u4e00-\u9fff]{2,20}$', username):
+        raise HTTPException(400, "username: 2-20 letters/digits/Chinese")
     try:
         user = dm.create_user(username, password)
         token = dm.login(username, password)

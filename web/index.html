@@ -258,13 +258,34 @@
 
 <!-- Login View -->
 <div id="loginView" class="login-wrap">
-  <div class="login-card">
+  <div class="login-card" id="loginForm">
     <div class="login-logo">G</div>
     <h1>GitLab Duo Proxy</h1>
-    <p>账号池控制台 · 请输入访问令牌</p>
-    <input type="password" id="loginToken" class="input" placeholder="WebUI Token" autofocus>
-    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:10px;" onclick="doLogin()">登 录</button>
-    <p class="hint" style="margin-top:14px;">令牌在服务启动日志中查看，或由 config.yaml 的 <code>pool.webui_token</code> 指定</p>
+    <p>登录或注册账号</p>
+    <div id="loginErr" style="color:var(--danger);font-size:12px;margin-bottom:8px;display:none;"></div>
+    <input type="text" id="loginUser" class="input" placeholder="用户名" autofocus>
+    <input type="password" id="loginPass" class="input" placeholder="密码">
+    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:10px;" id="loginBtn" onclick="doLogin()">登 录</button>
+    <div style="margin-top:12px;font-size:12px;color:var(--text-muted);">
+      还没有账号？<a href="javascript:showRegister()">立即注册</a>
+    </div>
+  </div>
+  <div class="login-card hidden" id="registerForm">
+    <div class="login-logo" style="background:var(--info);">+</div>
+    <h1>注册账号</h1>
+    <p>需要邮箱验证码</p>
+    <div id="regErr" style="color:var(--danger);font-size:12px;margin-bottom:8px;display:none;"></div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <input type="email" id="regEmail" class="input" placeholder="邮箱" style="flex:1;">
+      <button class="btn btn-primary" id="sendCodeBtn" onclick="sendRegCode()" style="white-space:nowrap;">获取验证码</button>
+    </div>
+    <input type="text" id="regCode" class="input" placeholder="验证码">
+    <input type="text" id="regUser" class="input" placeholder="用户名（2-20位字母/数字/中文）">
+    <input type="password" id="regPass" class="input" placeholder="密码（6位以上）">
+    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:10px;" id="regBtn" onclick="doRegister()">注 册</button>
+    <div style="margin-top:12px;font-size:12px;color:var(--text-muted);">
+      已有账号？<a href="javascript:showLogin()">返回登录</a>
+    </div>
   </div>
 </div>
 
@@ -305,7 +326,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       <span>退出登录</span>
     </button>
-    <div class="sidebar-footer">v2.0 · OpenAI 兼容</div>
+    <div class="sidebar-footer" id="sidebarFooter">v2.0 · OpenAI 兼容</div>
   </aside>
 
   <main class="main">
@@ -570,37 +591,87 @@
 
 <script>
 const API = '';  // same origin
-let TOKEN = localStorage.getItem('duo_webui_token') || '';
+let TOKEN = localStorage.getItem('duo_jwt') || '';
+let ADMIN_TOKEN = 'duo-admin-2026';  // system-level for update check etc
 let currentView = 'accounts';
 let models = [];
 
 /* ---------- Auth ---------- */
-function doLogin() {
-  const v = document.getElementById('loginToken').value.trim();
-  if (!v) return toast('请输入令牌', 'error');
-  TOKEN = v;
-  // verify
-  fetchJson('/v1/accounts/pool/summary').then(r => {
-    localStorage.setItem('duo_webui_token', TOKEN);
-    enterApp();
-  }).catch(e => {
-    TOKEN = ''; localStorage.removeItem('duo_webui_token');
-    toast('令牌无效: ' + (e.message||e), 'error');
-  });
+function showRegister() {
+  document.getElementById('loginForm').classList.add('hidden');
+  document.getElementById('registerForm').classList.remove('hidden');
+  document.getElementById('regErr').style.display = 'none';
 }
-function logout() {
-  TOKEN = ''; localStorage.removeItem('duo_webui_token');
-  location.reload();
+function showLogin() {
+  document.getElementById('registerForm').classList.add('hidden');
+  document.getElementById('loginForm').classList.remove('hidden');
 }
+
+async function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value.trim();
+  if (!u || !p) { showErr('loginErr','请输入用户名和密码'); return; }
+  const btn = document.getElementById('loginBtn');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const r = await fetch('/v1/auth/login', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:u,password:p})}).then(x=>x.json());
+    if (r.status==='ok') { TOKEN = r.token; localStorage.setItem('duo_jwt', TOKEN); enterApp(); }
+    else { showErr('loginErr', r.detail||'登录失败'); }
+  } catch(e) { showErr('loginErr', e.message||'网络错误'); }
+  finally { btn.disabled = false; btn.textContent = '登 录'; }
+}
+
+async function sendRegCode() {
+  const email = document.getElementById('regEmail').value.trim();
+  if (!email||email.indexOf('@')<1) { showErr('regErr','请输入有效邮箱'); return; }
+  const btn = document.getElementById('sendCodeBtn');
+  btn.disabled = true; btn.textContent = '发送中…';
+  try {
+    const r = await fetch('/v1/auth/send-code', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})}).then(x=>x.json());
+    if (r.status==='ok') {
+      toast('验证码已发送','success');
+      let cd = 60; btn.textContent = cd+'s';
+      const t = setInterval(()=>{ cd--; btn.textContent = cd+'s'; if(cd<=0){clearInterval(t); btn.textContent='获取验证码'; btn.disabled=false; }},1000);
+    } else { showErr('regErr', r.detail||'发送失败'); btn.disabled = false; btn.textContent = '获取验证码'; }
+  } catch(e) { showErr('regErr', e.message||'网络错误'); btn.disabled = false; btn.textContent = '获取验证码'; }
+}
+
+async function doRegister() {
+  const email = document.getElementById('regEmail').value.trim();
+  const code = document.getElementById('regCode').value.trim();
+  const user = document.getElementById('regUser').value.trim();
+  const pass = document.getElementById('regPass').value.trim();
+  if (!email||!code||!user||!pass) { showErr('regErr','请填写所有字段'); return; }
+  if (pass.length < 6) { showErr('regErr','密码至少6位'); return; }
+  const btn = document.getElementById('regBtn');
+  btn.disabled = true; btn.textContent = '注册中…';
+  try {
+    const r = await fetch('/v1/auth/register', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,code,username:user,password:pass})}).then(x=>x.json());
+    if (r.status==='ok') { TOKEN = r.token; localStorage.setItem('duo_jwt', TOKEN); enterApp(); }
+    else { showErr('regErr', r.detail||'注册失败'); }
+  } catch(e) { showErr('regErr', e.message||'网络错误'); }
+  finally { btn.disabled = false; btn.textContent = '注 册'; }
+}
+
+function showErr(id, msg) { const e = document.getElementById(id); e.textContent = msg; e.style.display = 'block'; }
+
+function logout() { TOKEN = ''; localStorage.removeItem('duo_jwt'); location.reload(); }
 function enterApp() {
   document.getElementById('loginView').classList.add('hidden');
   document.getElementById('appView').classList.remove('hidden');
+  // 显示用户名
+  fetch('/v1/auth/me', {headers:{'Authorization':'Bearer '+TOKEN}}).then(r=>r.json()).then(u=>{
+    if (u.username) document.getElementById('sidebarFooter').textContent = u.username + ' · v2.0';
+  }).catch(()=>{});
   switchView('accounts');
 }
 
 /* ---------- Fetch helpers ---------- */
 async function fetchJson(path, opts={}) {
-  const headers = { 'X-WebUI-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers||{}) };
+  const headers = { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json', ...(opts.headers||{}) };
   const res = await fetch(API + path, { ...opts, headers });
   if (res.status === 401) { logout(); throw new Error('未授权'); }
   const txt = await res.text();
@@ -632,13 +703,15 @@ function switchView(v) {
 /* ---------- Accounts ---------- */
 async function refreshAccounts() {
   try {
-    const [list, summary, cfg] = await Promise.all([
-      fetchJson('/v1/accounts/pool'),
-      fetchJson('/v1/accounts/pool/summary'),
-      fetchJson('/v1/accounts/pool/config'),
-    ]);
-    renderStats(summary, cfg);
-    renderAccounts(list.accounts||[]);
+    const accs = await fetchJson('/v1/user/accounts');
+    const list = accs.accounts || [];
+    renderAccounts(list);
+    const active = list.filter(a => a.enabled && a.status === 'active').length;
+    document.getElementById('stTotal').textContent = list.length;
+    document.getElementById('stActive').textContent = '活跃 ' + active;
+    document.getElementById('stReq').textContent = '-';
+    document.getElementById('stRate').textContent = '-';
+    document.getElementById('stStrategy').textContent = '用户池';
   } catch(e) { toast('加载失败: '+(e.message||e), 'error'); }
 }
 
@@ -723,7 +796,7 @@ async function openAddModal() {
 }
 async function openEditModal(id) {
   try {
-    const r = await fetchJson('/v1/accounts/pool/'+id);
+    const r = await fetchJson('/v1/user/accounts/'+id);
     editCache = r.account;
     showModal('编辑账号', r.account, true);
   } catch(e){ toast('加载失败: '+(e.message||e),'error'); }
@@ -789,8 +862,8 @@ async function saveAccount(isEdit, id) {
   if (!isEdit && !body.auth_value) { toast('请填写认证值','error'); btn.disabled=false; btn.textContent='保存'; return; }
   if (isEdit && !body.auth_value) delete body.auth_value;
   try {
-    if (isEdit) await fetchJson('/v1/accounts/pool/'+id, { method:'PUT', body: JSON.stringify(body) });
-    else await fetchJson('/v1/accounts/pool', { method:'POST', body: JSON.stringify(body) });
+    if (isEdit) await fetchJson('/v1/user/accounts/'+id, { method:'PUT', body: JSON.stringify(body) });
+    else await fetchJson('/v1/user/accounts', { method:'POST', body: JSON.stringify(body) });
     toast(isEdit?'已更新':'已添加','success');
     closeModal();
     refreshAccounts();
@@ -799,19 +872,19 @@ async function saveAccount(isEdit, id) {
 
 async function deleteAccount(id, name) {
   if (!confirm('确定删除账号「'+name+'」？此操作不可撤销。')) return;
-  try { await fetchJson('/v1/accounts/pool/'+id, {method:'DELETE'}); toast('已删除','success'); refreshAccounts(); }
+  try { await fetchJson('/v1/user/accounts/'+id, {method:'DELETE'}); toast('已删除','success'); refreshAccounts(); }
   catch(e){ toast('删除失败: '+(e.message||e),'error'); }
 }
 
 async function resetAccount(id) {
-  try { await fetchJson('/v1/accounts/pool/'+id+'/reset', {method:'POST'}); toast('已重置为活跃','success'); refreshAccounts(); }
+  try { await fetchJson('/v1/user/accounts/'+id+'/reset', {method:'POST'}); toast('已重置为活跃','success'); refreshAccounts(); }
   catch(e){ toast('重置失败: '+(e.message||e),'error'); }
 }
 
 async function testAccount(id) {
   toast('正在测试…','info');
   try {
-    const r = await fetchJson('/v1/accounts/pool/'+id+'/test', {method:'POST'});
+    const r = await fetchJson('/v1/user/accounts/'+id+'/test', {method:'POST'});
     if (r.status==='ok') {
       toast('测试成功: '+(r.user&&r.user.username?('@'+r.user.username):'OK'),'success');
     } else if (r.status==='fail') {
@@ -826,35 +899,20 @@ async function testAccount(id) {
 /* ---------- Settings ---------- */
 async function loadSettings() {
   try {
-    const [cfg, info] = await Promise.all([
-      fetchJson('/v1/accounts/pool/config'),
-      fetchJson('/v1/accounts/info'),
-    ]);
-    document.getElementById('cfgStrategy').value = cfg.strategy||'round_robin';
-    document.getElementById('cfgCooldown').value = cfg.cooldown_seconds||60;
-    document.getElementById('cfgMaxFail').value = cfg.max_consecutive_failures||3;
-    document.getElementById('cfgInvalidAuth').checked = cfg.invalid_on_auth_error!==false;
+    const h = { 'X-WebUI-Token': ADMIN_TOKEN, 'Content-Type': 'application/json' };
+    const r = await fetch('/v1/accounts/info', {headers:h}).then(x=>x.json());
     document.getElementById('svcInfo').innerHTML = `
-      <div><b>协议版本:</b> ${esc(info.protocol_version||'-')}</div>
-      <div><b>GitLab 地址:</b> ${esc(info.base_url||'-')}</div>
-      <div><b>默认模型:</b> ${esc(info.default_model||'-')}</div>
-      <div><b>当前认证:</b> ${esc(info.auth_type||'-')} · ${esc(info.auth_value_preview||'***')}</div>
-      <div><b>CSRF Token:</b> ${info.csrf_token_set?'已获取':'未设置'}</div>
-      <div><b>可用模型:</b> ${(info.available_models||[]).map(m=>'<span class="tag" style="margin-right:4px;">'+esc(m)+'</span>').join('')}</div>
-      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><b>OpenAI 兼容端点:</b><br><code style="font-family:var(--mono);font-size:12px;">POST /v1/chat/completions</code></div>`;
-    // retry count isn't in pool config (it's server config), read from summary indirectly — leave default
-    document.getElementById('cfgRetry').value = 3;
-  } catch(e){ toast('加载设置失败: '+(e.message||e),'error'); }
+      <div><b>协议版本:</b> ${esc(r.protocol_version||'-')}</div>
+      <div><b>GitLab 地址:</b> ${esc(r.base_url||'-')}</div>
+      <div><b>默认模型:</b> ${esc(r.default_model||'-')}</div>
+      <div><b>可用模型:</b> ${(r.available_models||[]).map(m=>'<span class="tag" style="margin-right:4px;">'+esc(m)+'</span>').join('')}</div>
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><b>API 端点:</b><br><code style="font-family:var(--mono);font-size:12px;">POST /v1/chat/completions</code></div>
+      <div style="margin-top:4px;"><b>Responses API:</b><br><code style="font-family:var(--mono);font-size:12px;">POST /v1/responses</code></div>`;
+  } catch(e){ toast('加载失败: '+(e.message||e), 'error'); }
 }
-
-async function saveSettings() {
-  const body = {
-    strategy: document.getElementById('cfgStrategy').value,
-    cooldown_seconds: parseInt(document.getElementById('cfgCooldown').value),
-    max_consecutive_failures: parseInt(document.getElementById('cfgMaxFail').value),
-    invalid_on_auth_error: document.getElementById('cfgInvalidAuth').checked,
-  };
-  try { await fetchJson('/v1/accounts/pool/config', {method:'PUT', body:JSON.stringify(body)}); toast('已保存','success'); }
+async function saveSettings() { toast('用户级配置通过 API 管理', 'info'); }
+;
+  try { await fetchJson('/v1/user/accounts/config', {method:'PUT', body:JSON.stringify(body)}); toast('已保存','success'); }
   catch(e){ toast('保存失败: '+(e.message||e),'error'); }
 }
 
@@ -900,7 +958,7 @@ async function sendChat() {
   try {
     const res = await fetch(API + '/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type':'application/json', 'X-WebUI-Token': TOKEN },
+      headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+TOKEN },
       body: JSON.stringify({ model, messages:[{role:'user',content:text}], stream }),
     });
     if (!res.ok) {
@@ -1128,7 +1186,7 @@ async function brwSaveAccount() {
 /* ---------- API Keys ---------- */
 async function refreshApiKeys() {
   try {
-    const r = await fetchJson('/v1/api-keys');
+    const r = await fetchJson('/v1/user/api-keys');
     renderApiKeys(r.keys||[]);
   } catch(e){ toast('加载失败: '+(e.message||e),'error'); }
 }
@@ -1157,7 +1215,7 @@ async function genApiKey() {
   const name = prompt('密钥名称（如：我的ChatBox、OpenWebUI接入）');
   if (!name) return;
   try {
-    const r = await fetchJson('/v1/api-keys', { method:'POST', body: JSON.stringify({name}) });
+    const r = await fetchJson('/v1/user/api-keys', { method:'POST', body: JSON.stringify({name}) });
     const key = r.key;
     copyToClipboard(key);
     const msg = document.getElementById('modalRoot');
@@ -1176,7 +1234,7 @@ async function genApiKey() {
 }
 async function revokeApiKey(id) {
   if (!confirm('确定要吊销此密钥？吊销后无法恢复，所有使用此密钥的客户端将立即失效。')) return;
-  try { await fetchJson('/v1/api-keys/'+id, {method:'DELETE'}); toast('已吊销','success'); refreshApiKeys(); }
+  try { await fetchJson('/v1/user/api-keys/'+id, {method:'DELETE'}); toast('已吊销','success'); refreshApiKeys(); }
   catch(e){ toast('吊销失败: '+(e.message||e),'error'); }
 }
 
@@ -1212,8 +1270,16 @@ async function doUpdate() {
 
 /* boot */
 if (TOKEN) {
-  fetchJson('/v1/accounts/pool/summary').then(()=>enterApp()).catch(()=>{});
+  fetch('/v1/auth/me', {headers:{'Authorization':'Bearer '+TOKEN}}).then(r=>r.ok?r.json():Promise.reject())
+    .then(u => { if(u.id) enterApp(); }).catch(()=>{ TOKEN=''; localStorage.removeItem('duo_jwt'); });
 }
+// Enter key on login
+document.addEventListener('keydown', e => {
+  if (e.key==='Enter' && document.getElementById('loginView').classList.contains('hidden')===false) {
+    if (!document.getElementById('registerForm').classList.contains('hidden')) doRegister();
+    else doLogin();
+  }
+});
 </script>
 </body>
 </html>
