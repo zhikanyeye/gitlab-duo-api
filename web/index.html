@@ -826,10 +826,10 @@ function showModal(title, a, isEdit) {
           <div class="field">
             <label>认证方式</label>
             <select id="f_auth_type" class="select">
-              <option value="cookie" ${a.auth_type==='cookie'?'selected':''}>Cookie (推荐)</option>
+              <option value="cookie" ${a.auth_type==='cookie'?'selected':''}>Cookie (浏览器F12复制)</option>
+              <option value="pat" ${a.auth_type==='pat'?'selected':''}>PAT (glpat-xxx 更稳定)</option>
               <option value="token" ${a.auth_type==='token'?'selected':''}>Personal Access Token</option>
               <option value="session" ${a.auth_type==='session'?'selected':''}>Session Token</option>
-              <option value="oauth" ${a.auth_type==='oauth'?'selected':''}>OAuth Bearer</option>
             </select>
           </div>
           <div class="field">
@@ -851,12 +851,28 @@ function showModal(title, a, isEdit) {
       </div>
       <div class="modal-foot">
         <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+        <button class="btn btn-ghost" id="verifyAccBtn" onclick="verifyAccount()">验证</button>
         <button class="btn btn-primary" id="saveAccBtn" onclick="saveAccount(${isEdit?'true':'false'}, '${esc(a.id||'')}')">保存</button>
       </div>
     </div></div>`;
 }
 
 function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+
+async function verifyAccount() {
+  const btn = document.getElementById('verifyAccBtn');
+  const body = {
+    auth_type: document.getElementById('f_auth_type').value,
+    auth_value: document.getElementById('f_auth_value').value.trim(),
+  };
+  if (!body.auth_value) { toast('请填写认证值','error'); return; }
+  btn.disabled = true; btn.textContent = '验证中…';
+  try {
+    const r = await fetchJson('/v1/user/accounts/verify', {method:'POST', body:JSON.stringify(body)});
+    toast(r.message || r.status, r.status==='ok'?'success':'error');
+  } catch(e) { toast('验证失败: '+(e.message||e),'error'); }
+  finally { btn.disabled = false; btn.textContent = '验证'; }
+}
 
 async function saveAccount(isEdit, id) {
   const btn = document.getElementById('saveAccBtn');

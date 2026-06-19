@@ -1217,6 +1217,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                 try:
                     async for chunk in sess.chat_stream(
                         prompt=prompt, model_name=model,
+                        pat=(account.auth_value if account.auth_type == "pat" else ""),
                     ):
                         streamed_any = True
                         yield chunk
@@ -2048,6 +2049,38 @@ async def user_accounts_update(aid: str, request: Request, authorization: Option
         raise HTTPException(404)
     invalidate_user_pool(user["id"])
     return {"status": "ok", "account": acc}
+
+
+@app.post("/v1/user/accounts/verify")
+async def user_accounts_verify(request: Request, authorization: Optional[str] = Header(None)):
+    """验证 PAT/Cookie 是否有效"""
+    await _get_user_from_auth(authorization)
+    body = await request.json()
+    auth_type = (body.get("auth_type") or "cookie").strip()
+    auth_value = (body.get("auth_value") or "").strip()
+    if not auth_value:
+        raise HTTPException(400, "auth_value required")
+    try:
+        if auth_type == "pat":
+            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+                r = await cl.get(config.gitlab_base_url + "/api/v4/user",
+                                 headers={"PRIVATE-TOKEN": auth_value})
+                if r.status_code == 200:
+                    u = r.json()
+                    return {"status": "ok", "message": f"有效 - {u['username']} (@{u.get('email','')})"}
+                raise HTTPException(400, f"PAT 无效 (HTTP {r.status_code})")
+        else:
+            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+                r = await cl.get(config.gitlab_base_url + "/api/v4/user",
+                                 headers={"Cookie": auth_value})
+                if r.status_code == 200:
+                    u = r.json()
+                    return {"status": "ok", "message": f"有效 - {u['username']}"}
+                raise HTTPException(400, f"认证失败 (HTTP {r.status_code})")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"验证出错: {e}")
 
 
 @app.delete("/v1/user/accounts/{aid}")
