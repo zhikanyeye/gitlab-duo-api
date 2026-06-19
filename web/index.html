@@ -825,9 +825,9 @@ function showModal(title, a, isEdit) {
           </div>
           <div class="field">
             <label>认证方式</label>
-            <select id="f_auth_type" class="select">
+            <select id="f_auth_type" class="select" onchange="onAuthTypeChange()">
               <option value="cookie" ${a.auth_type==='cookie'?'selected':''}>Cookie (浏览器F12复制)</option>
-              <option value="pat" ${a.auth_type==='pat'?'selected':''}>PAT (glpat-xxx 更稳定)</option>
+              <option value="pat" ${a.auth_type==='pat'?'selected':''}>PAT + Cookie (推荐，更稳定)</option>
               <option value="token" ${a.auth_type==='token'?'selected':''}>Personal Access Token</option>
               <option value="session" ${a.auth_type==='session'?'selected':''}>Session Token</option>
             </select>
@@ -840,8 +840,13 @@ function showModal(title, a, isEdit) {
           </div>
           <div class="field full">
             <label>认证值 <span class="req">*</span> ${isEdit?'<span style="color:var(--text-faint);font-weight:400;">(留空则不修改)</span>':''}</label>
-            <textarea id="f_auth_value" class="input" placeholder="${a.auth_type==='cookie'?'_gitlab_session=xxx; ...':'token 或 session 值'}">${esc(isEdit?'':a.auth_value)}</textarea>
-            <div class="hint">Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制</div>
+            <textarea id="f_auth_value" class="input" placeholder="${a.auth_type==='pat'?'glpat-xxxxxxxxxxxx':'Cookie 或 Token 值'}">${esc(isEdit?'':a.auth_value)}</textarea>
+            <div class="hint" id="hint_auth">${a.auth_type==='pat'?'PAT: GitLab Settings → Access Tokens → 勾选所有权限':'Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制'}</div>
+          </div>
+          <div class="field full" id="field_cookie" style="${a.auth_type==='pat'?'':'display:none'}">
+            <label>浏览器 Cookie <span style="color:var(--text-faint);font-weight:400;">(选填，用于浏览器发送)</span></label>
+            <textarea id="f_cookie_value" class="input" placeholder="_gitlab_session=xxx; cf_clearance=xxx; ...">${esc(isEdit?'':a.cookie_value||'')}</textarea>
+            <div class="hint">PAT 本身无法触发浏览器发送，需附带 Cookie 辅助。浏览器登录后自动填充</div>
           </div>
           <div class="field full">
             <label>备注</label>
@@ -858,6 +863,13 @@ function showModal(title, a, isEdit) {
 }
 
 function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+function onAuthTypeChange() {
+  const t = document.getElementById('f_auth_type').value;
+  const fc = document.getElementById('field_cookie');
+  if (fc) fc.style.display = t === 'pat' ? '' : 'none';
+  const hint = document.getElementById('hint_auth');
+  if (hint) hint.textContent = t === 'pat' ? 'PAT: GitLab Settings → Access Tokens → 勾选所有权限' : 'Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制';
+}
 
 async function verifyAccount() {
   const btn = document.getElementById('verifyAccBtn');
@@ -883,6 +895,7 @@ async function saveAccount(isEdit, id) {
     auth_value: document.getElementById('f_auth_value').value.trim(),
     note: document.getElementById('f_note').value.trim(),
     enabled: document.getElementById('f_enabled').checked,
+    cookie_value: document.getElementById('f_cookie_value')?.value?.trim?.() || '',
   };
   if (!body.name) { toast('请填写名称','error'); btn.disabled=false; btn.textContent='保存'; return; }
   if (!isEdit && !body.auth_value) { toast('请填写认证值','error'); btn.disabled=false; btn.textContent='保存'; return; }

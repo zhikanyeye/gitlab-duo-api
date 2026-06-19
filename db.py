@@ -82,6 +82,12 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        # Migration: add cookie_value column if not exists
+        cols = self._conn.execute("PRAGMA table_info(accounts)").fetchall()
+        col_names = [c[1] for c in cols]
+        if 'cookie_value' not in col_names:
+            self._conn.execute("ALTER TABLE accounts ADD COLUMN cookie_value TEXT DEFAULT ''")
+            logger.info("[db] migration: added cookie_value column")
         self._conn.commit()
 
     def execute(self, sql, *params):
@@ -239,11 +245,11 @@ class DataManager:
 
     # ---- Accounts ----
     def create_account(self, user_id: str, name: str, auth_type: str,
-                       auth_value: str, note: str = "") -> dict:
+                       auth_value: str, note: str = "", cookie_value: str = "") -> dict:
         aid = secrets.token_hex(10)
         self.db.execute(
-            "INSERT INTO accounts(id, user_id, name, auth_type, auth_value, note, created_at) VALUES(?,?,?,?,?,?,?)",
-            aid, user_id, name, auth_type, auth_value, note, time.time()
+            "INSERT INTO accounts(id, user_id, name, auth_type, auth_value, note, cookie_value, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            aid, user_id, name, auth_type, auth_value, note, cookie_value, time.time()
         )
         self.db.commit()
         return self.get_account(aid)
@@ -262,6 +268,8 @@ class DataManager:
             # mask auth_value
             v = r.get("auth_value", "")
             r["auth_value"] = (v[:8] + "..." + v[-4:]) if len(v) > 16 else ("***" if v else "")
+            cv = r.get("cookie_value", "") or ""
+            r["cookie_value"] = (cv[:8] + "..." + cv[-4:]) if len(cv) > 16 else ("***" if cv else "")
         return rows
 
     def update_account(self, aid: str, **fields) -> Optional[dict]:

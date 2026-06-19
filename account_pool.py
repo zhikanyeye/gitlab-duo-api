@@ -51,8 +51,9 @@ class AccountStats:
 class Account:
     id: str
     name: str
-    auth_type: str                  # cookie | token | session | oauth
+    auth_type: str                  # cookie | pat | token | session | oauth
     auth_value: str
+    cookie_value: str = ""          # PAT 账户可附带 cookie 用于浏览器发送
     enabled: bool = True
     status: str = "active"          # active | cooldown | disabled | invalid
     cooldown_until: float = 0.0     # unix ts
@@ -73,6 +74,12 @@ class Account:
                 d["auth_value"] = v[:8] + "..." + v[-4:]
             else:
                 d["auth_value"] = "***"
+        if mask and d.get("cookie_value"):
+            cv = d["cookie_value"]
+            if len(cv) > 16:
+                d["cookie_value"] = cv[:8] + "..." + cv[-4:]
+            else:
+                d["cookie_value"] = "***"
         return d
 
     def is_available(self, now: float) -> bool:

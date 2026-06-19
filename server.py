@@ -1194,12 +1194,13 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                         logging.warning("[Pool] temp session create failed: %s", e)
                         await pool.report_failure(account.id, last_error)
                         continue
-                    # 用账号 cookie 覆盖
+                    # 用账号 cookie 覆盖 (PAT账户用 cookie_value, cookie账户用 auth_value)
                     from urllib.parse import urlparse as _up
                     host = _up(config.gitlab_base_url).hostname
                     domain = "." + ".".join(host.split(".")[-2:])
+                    cookie_src = (account.cookie_value or account.auth_value) if account.auth_type == "pat" else account.auth_value
                     cookies_to_set = []
-                    for pair in account.auth_value.split(";"):
+                    for pair in cookie_src.split(";"):
                         pair = pair.strip()
                         if "=" not in pair: continue
                         n, _, v = pair.partition("=")
@@ -2029,8 +2030,8 @@ async def user_accounts_add(request: Request, authorization: Optional[str] = Hea
     auth_value = (body.get("auth_value") or "").strip()
     if not name or not auth_value:
         raise HTTPException(400, "name and auth_value required")
-    acc = dm.create_account(user["id"], name, auth_type, auth_value, body.get("note", ""))
-    invalidate_user_pool(user["id"])
+    cookie_value = (body.get("cookie_value") or "").strip()
+    acc = dm.create_account(user["id"], name, auth_type, auth_value, body.get("note", ""), cookie_value=cookie_value)
     return {"status": "ok", "account": acc}
 
 
