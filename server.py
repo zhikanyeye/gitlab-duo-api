@@ -836,6 +836,7 @@ class GitLabDuoClientV2:
 
         尝试多种 mutation 方式以兼容不同版本的 GitLab
         """
+        strategy_errors: List[str] = []
 
         # Strategy 1: Try sendDuoChatMessage mutation (preferred for newer GitLab)
         try:
@@ -860,6 +861,7 @@ class GitLabDuoClientV2:
                     "method": "sendDuoChatMessage",
                 }
         except Exception as e:
+            strategy_errors.append(f"sendDuoChatMessage: {e}")
             logging.debug(f"sendDuoChatMessage failed: {e}")
 
         # Strategy 2: Try aiAction mutation (fallback)
@@ -883,6 +885,7 @@ class GitLabDuoClientV2:
                     "method": "aiAction",
                 }
         except Exception as e:
+            strategy_errors.append(f"aiAction: {e}")
             logging.debug(f"aiAction failed: {e}")
 
         # Strategy 3: Create new workflow then poll
@@ -908,9 +911,11 @@ class GitLabDuoClientV2:
                     "method": "createDuoWorkflow",
                 }
         except Exception as e:
+            strategy_errors.append(f"createDuoWorkflow: {e}")
             logging.debug(f"createDuoWorkflow failed: {e}")
 
-        raise Exception("All message sending strategies failed")
+        detail = " | ".join(strategy_errors) if strategy_errors else "no strategy returned a workflow id"
+        raise Exception(f"All message sending strategies failed: {detail}")
 
     async def poll_workflow_response(
         self,
@@ -1616,10 +1621,11 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                     except Exception as e:
                         last_error = f"direct GraphQL chat failed: {e}"
                         logging.warning("[Pool] direct GraphQL chat failed for account '%s': %s", account.name, e)
+                        await user_pool.report_failure(account.id, last_error)
                         if streamed_any:
-                            await user_pool.report_failure(account.id, last_error)
                             yield "data: [DONE]\n\n"
                             return
+                        continue
 
                 # 优先复用 pinned 会话，否则用 cookie 创建临时浏览器会话
                 sess = login_mgr.get_pinned(account.id) if login_mgr else None
