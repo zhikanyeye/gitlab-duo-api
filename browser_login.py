@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
+import re
 import time
 import uuid
 from typing import Awaitable, Callable, Dict, List, Optional, AsyncGenerator
@@ -23,6 +25,49 @@ logger = logging.getLogger("browser_login")
 
 GITLAB_SIGN_IN_PATH = "/users/sign_in"
 VIEWPORT_DEFAULT = (1024, 680)
+WORKFLOW_GID_RE = re.compile(r"gid://gitlab/Ai::DuoWorkflows::Workflow/\d+")
+MODEL_ID_MAP = {
+    "claude-opus-4.8": "anthropic/claude-opus-4.8",
+    "claude-sonnet-4": "anthropic/claude-sonnet-4",
+    "claude-haiku-3.5": "anthropic/claude-haiku-3.5",
+    "gpt-5.5": "openai/gpt-5.5",
+    "gitlab-duo": "gitlab_duo",
+    "duo-chat": "duo_chat",
+}
+
+MUTATION_CREATE_WORKFLOW = """
+mutation createDuoWorkflow($input: CreateDuoWorkflowInput!) {
+  createDuoWorkflow(input: $input) {
+    errors
+    workflow {
+      id
+      status
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
+
+def _first_workflow_gid(value) -> str:
+    """Find a Duo Workflow gid in nested response/request data."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        m = WORKFLOW_GID_RE.search(value)
+        return m.group(0) if m else ""
+    if isinstance(value, dict):
+        for v in value.values():
+            found = _first_workflow_gid(v)
+            if found:
+                return found
+    if isinstance(value, list):
+        for v in value:
+            found = _first_workflow_gid(v)
+            if found:
+                return found
+    return ""
 
 
 class BrowserLoginSession:
@@ -384,7 +429,6 @@ class BrowserLoginSession:
     ) -> AsyncGenerator[str, None]:
         """驱动 GitLab Duo Chat UI 发送消息并流式返回 OpenAI SSE。"""
         import httpx
-        import re as _re
 
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created_ts = int(time.time())
@@ -404,20 +448,29 @@ class BrowserLoginSession:
             yield mk("[Proxy Error] 会话已关闭", finish="error")
             yield "data: [DONE]\n\n"; return
 
-        gid_re = _re.compile(r"gid://gitlab/Ai::DuoWorkflows::Workflow/\d+")
         captured_wid: List[str] = []
+        sent_at = time.time()
+
+        def remember_wid(wid: str, source: str) -> None:
+            if wid and wid not in captured_wid:
+                captured_wid.append(wid)
+                logger.info("[chat] captured workflow_id=%s from %s", wid, source)
 
         async def on_resp(resp):
             try:
                 if "/api/graphql" not in resp.url or resp.request.method != "POST": return
                 body = await resp.text()
-                m = gid_re.search(body)
-                if m and not captured_wid:
-                    captured_wid.append(m.group(0))
-                    logger.info("[chat] captured workflow_id=%s", m.group(0))
+                remember_wid(_first_workflow_gid(body), "graphql response")
+            except Exception: pass
+
+        async def on_req(req):
+            try:
+                if "/api/graphql" not in req.url or req.method != "POST": return
+                remember_wid(_first_workflow_gid(req.post_data or ""), "graphql request")
             except Exception: pass
 
         self.page.on("response", on_resp)
+        self.page.on("request", on_req)
         try:
             # 如果页面已在 dashboard 且 chat 面板打开，跳过导航和 toggle
             is_home = "/dashboard" in (self.current_url or "")
@@ -470,11 +523,19 @@ class BrowserLoginSession:
                 yield mk("[Proxy Error] 发送失败", finish="error")
                 yield "data: [DONE]\n\n"; return
 
-            for _ in range(30):
+            for _ in range(60):
                 if captured_wid: break
                 await asyncio.sleep(0.5)
             if not captured_wid:
-                yield mk("[Proxy Error] 未能拦截到 workflow_id", finish="error")
+                fallback_wid = await self._find_recent_workflow_id(prompt, sent_at, pat=pat)
+                if fallback_wid:
+                    remember_wid(fallback_wid, "recent workflow fallback")
+            if not captured_wid:
+                fallback_wid = await self._create_workflow_fallback(prompt, model_name, pat=pat)
+                if fallback_wid:
+                    remember_wid(fallback_wid, "create workflow fallback")
+            if not captured_wid:
+                yield mk("[Proxy Error] 未能拦截到 workflow_id；请确认 GitLab Duo Chat 页面已正常发送消息，或稍后重试", finish="error")
                 yield "data: [DONE]\n\n"; return
 
             wid = captured_wid[0]
@@ -537,6 +598,76 @@ class BrowserLoginSession:
         finally:
             try: self.page.remove_listener("response", on_resp)
             except Exception: pass
+            try: self.page.remove_listener("request", on_req)
+            except Exception: pass
+
+    async def _graphql_headers(self, pat: str = "") -> Dict[str, str]:
+        if pat:
+            return {
+                "PRIVATE-TOKEN": pat,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Gitlab-Feature-Category": "duo_agent_platform",
+            }
+
+        cookie_str = await self.get_cookies_str()
+        csrf = ""
+        try:
+            if self.page:
+                csrf = await self.page.evaluate(
+                    "() => (document.querySelector('meta[name=csrf-token]')||{}).content || ''"
+                )
+        except Exception:
+            csrf = ""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": self.base_url,
+            "Referer": self.base_url + "/dashboard/home",
+            "X-Gitlab-Feature-Category": "duo_agent_platform",
+            "Cookie": cookie_str,
+        }
+        if csrf:
+            headers["X-Csrf-Token"] = csrf
+        return headers
+
+    async def _find_recent_workflow_id(self, prompt: str, sent_at: float, pat: str = "") -> str:
+        """Best-effort placeholder for future workflow-list schemas."""
+        return ""
+
+    async def _create_workflow_fallback(self, prompt: str, model_name: str, pat: str = "") -> str:
+        """Create a workflow directly when the browser UI response did not expose its id."""
+        import httpx
+
+        model_id = MODEL_ID_MAP.get(model_name, model_name)
+        payload = {
+            "operationName": "createDuoWorkflow",
+            "query": MUTATION_CREATE_WORKFLOW,
+            "variables": {
+                "input": {
+                    "goal": prompt,
+                    "definition": "chat",
+                    "modelId": model_id,
+                }
+            },
+        }
+        try:
+            headers = await self._graphql_headers(pat=pat)
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cl:
+                resp = await cl.post(self.base_url + "/api/graphql", json=payload, headers=headers)
+            data = resp.json()
+            wid = _first_workflow_gid(data)
+            if wid:
+                logger.info("[chat] created fallback workflow_id=%s", wid)
+                return wid
+            errors = data.get("errors") or data.get("data", {}).get("createDuoWorkflow", {}).get("errors")
+            if errors:
+                logger.warning("[chat] create workflow fallback errors: %s", errors)
+            else:
+                logger.warning("[chat] create workflow fallback returned no workflow id: HTTP %s", resp.status_code)
+        except Exception as e:
+            logger.warning("[chat] create workflow fallback failed: %s", e)
+        return ""
 
     async def close(self) -> None:
         """仅关闭 context，不关 browser。"""
