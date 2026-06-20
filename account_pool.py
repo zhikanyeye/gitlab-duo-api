@@ -31,6 +31,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger("account_pool")
 
 
+def _stats_from_raw(raw) -> Dict:
+    """Accept stats stored as JSON text or already-decoded dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw) or {}
+        except Exception:
+            logger.warning("Invalid account stats JSON, resetting stats")
+    return {}
+
+
 # ============================================================
 # Data Models
 # ============================================================
@@ -163,7 +175,7 @@ class AccountPool:
             return accounts
         rows = self.data_manager.get_available_accounts(self.user_id)
         for row in rows:
-            stats_data = json.loads(row.get("stats") or "{}") or {}
+            stats_data = _stats_from_raw(row.get("stats"))
             acc = Account(
                 id=row["id"],
                 name=row["name"],
