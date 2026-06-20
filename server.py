@@ -823,6 +823,59 @@ class GitLabDuoClientV2:
     }
     """
 
+    async def _rest_chat_completion(
+        self,
+        prompt: str,
+        override_auth: Optional[str] = None,
+        resource: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Try GitLab's documented REST Chat completions API.
+
+        GitLab docs note this endpoint is internal-only on GitLab.com and
+        feature-flagged on Self-Managed, so failure here should fall back to
+        the GraphQL workflow strategies below.
+        """
+        payload: Dict[str, Any] = {
+            "content": prompt,
+            "referer_url": f"{self.base_url}/dashboard/home",
+            "with_clean_history": False,
+        }
+        if resource:
+            payload["referer_url"] = resource
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain",
+            "User-Agent": "GitLab-Duo-Proxy/2.0",
+        }
+        auth_value = override_auth or self.config.auth_value
+        headers.update(self._auth_headers(auth_value))
+
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout, follow_redirects=True) as http:
+                resp = await http.post(f"{self.base_url}/api/v4/chat/completions", json=payload, headers=headers)
+            if resp.status_code >= 400:
+                err = f"REST chat completions HTTP {resp.status_code}: {resp.text[:300]}"
+                logging.debug(err)
+                return None, err
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if "application/json" in ctype:
+                data = resp.json()
+                if isinstance(data, str):
+                    return data, None
+                if isinstance(data, dict):
+                    for key in ("content", "response", "message", "text"):
+                        if isinstance(data.get(key), str):
+                            return data[key], None
+                    return json.dumps(data, ensure_ascii=False), None
+            text = resp.text.strip()
+            return (text, None) if text else (None, "REST chat completions returned an empty response")
+        except Exception as e:
+            err = f"REST chat completions failed: {e}"
+            logging.debug(err)
+            return None, err
+
     async def send_message_to_workflow(
         self,
         prompt: str,
@@ -1065,7 +1118,47 @@ class GitLabDuoClientV2:
             yield f"data: {json.dumps(initial_chunk)}\n\n"
 
         _send_succeeded = False
+        rest_error: Optional[str] = None
         try:
+            # Step 0: Try documented REST Chat API first.
+            rest_content, rest_error = await self._rest_chat_completion(
+                prompt=prompt,
+                override_auth=override_auth,
+                resource=kwargs.get("resource"),
+            )
+            if rest_content:
+                _send_succeeded = True
+                if not emit_initial_role:
+                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                content_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": rest_content},
+                        "finish_reason": None,
+                    }],
+                }
+                done_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+                yield f"data: {json.dumps(done_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if rest_error:
+                logging.debug(rest_error)
+
             # Step 1: Send message
             send_result = await self.send_message_to_workflow(
                 prompt=prompt,
@@ -1179,15 +1272,18 @@ class GitLabDuoClientV2:
                     return
 
         except Exception as e:
+            error_text = str(e)
+            if rest_error:
+                error_text = f"{rest_error} | {error_text}"
             # Send-phase failure: notify pool and optionally re-raise for retry
             if not _send_succeeded:
                 if on_send_error:
                     try:
-                        await on_send_error(str(e))
+                        await on_send_error(error_text)
                     except Exception:
                         pass
                 if raise_on_send_error:
-                    raise
+                    raise Exception(error_text) from e
             error_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1195,7 +1291,7 @@ class GitLabDuoClientV2:
                 "model": model_name,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": f"\n\n[Proxy Error] {str(e)}"},
+                    "delta": {"content": f"\n\n[Proxy Error] {error_text}"},
                     "finish_reason": "error",
                 }],
             }
