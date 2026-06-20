@@ -1396,7 +1396,7 @@ async def startup():
             logging.info("[db] promoted first user '%s' to admin", first["username"])
 
     # 记录当前 commit（用于更新检测）
-    import subprocess, os
+    import subprocess
     try:
         r = subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
                           capture_output=True, text=True, timeout=10,
@@ -2274,7 +2274,7 @@ async def check_update(request: Request):
 async def do_update(request: Request):
     """Git pull + systemctl restart。"""
     await _require_webui_or_admin(request)
-    import subprocess, os
+    import subprocess
     proj_dir = str(Path(__file__).parent)
     try:
         result = subprocess.run(
