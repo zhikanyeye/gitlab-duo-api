@@ -14,6 +14,7 @@ GitLab Duo Proxy — Database & Auth (SQLite)
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("db")
+JWT_SECRET_PATH = Path(__file__).parent / "data" / "jwt_secret"
 
 # ============================================================
 # Database
@@ -114,7 +116,23 @@ class Database:
 # Auth
 # ============================================================
 
-JWT_SECRET = secrets.token_hex(32)
+def _load_jwt_secret() -> str:
+    env_secret = os.environ.get("JWT_SECRET") or os.environ.get("DUO_JWT_SECRET")
+    if env_secret:
+        return env_secret
+    try:
+        if JWT_SECRET_PATH.exists():
+            return JWT_SECRET_PATH.read_text(encoding="utf-8").strip()
+        JWT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        secret = secrets.token_hex(32)
+        JWT_SECRET_PATH.write_text(secret, encoding="utf-8")
+        return secret
+    except Exception:
+        logger.warning("Could not persist JWT secret; login tokens will reset on restart.")
+        return secrets.token_hex(32)
+
+
+JWT_SECRET = _load_jwt_secret()
 
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(8)
@@ -124,7 +142,8 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, stored: str) -> bool:
     try:
         salt, h = stored.split("$", 1)
-        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex() == h
+        expected = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+        return secrets.compare_digest(expected, h)
     except Exception:
         return False
 
@@ -260,6 +279,12 @@ class DataManager:
             row["stats"] = json.loads(row["stats"]) if row.get("stats") else {}
         return row
 
+    def get_user_account(self, user_id: str, aid: str) -> Optional[dict]:
+        row = self.db.fetchone("SELECT * FROM accounts WHERE id=? AND user_id=?", aid, user_id)
+        if row:
+            row["stats"] = json.loads(row["stats"]) if row.get("stats") else {}
+        return row
+
     def list_accounts(self, user_id: str) -> List[dict]:
         rows = self.db.fetchall("SELECT * FROM accounts WHERE user_id=? ORDER BY created_at DESC", user_id)
         for r in rows:
@@ -280,10 +305,20 @@ class DataManager:
         self.db.commit()
         return self.get_account(aid)
 
+    def update_user_account(self, user_id: str, aid: str, **fields) -> Optional[dict]:
+        if not self.get_user_account(user_id, aid):
+            return None
+        return self.update_account(aid, **fields)
+
     def delete_account(self, aid: str) -> bool:
         self.db.execute("DELETE FROM accounts WHERE id=?", aid)
         self.db.commit()
         return True
+
+    def delete_user_account(self, user_id: str, aid: str) -> bool:
+        cur = self.db.execute("DELETE FROM accounts WHERE id=? AND user_id=?", aid, user_id)
+        self.db.commit()
+        return cur.rowcount > 0
 
     def get_available_accounts(self, user_id: str) -> List[dict]:
         rows = self.db.fetchall(
@@ -348,6 +383,11 @@ class DataManager:
         self.db.execute("UPDATE api_keys SET enabled=0 WHERE id=?", kid)
         self.db.commit()
         return True
+
+    def revoke_user_api_key(self, user_id: str, kid: str) -> bool:
+        cur = self.db.execute("UPDATE api_keys SET enabled=0 WHERE id=? AND user_id=?", kid, user_id)
+        self.db.commit()
+        return cur.rowcount > 0
 
     # ---- Config ----
     def get_config(self, key: str, default: str = "") -> str:

@@ -125,6 +125,7 @@ class AppConfig:
     pool_invalid_on_auth_error: bool = True
     # WebUI access token (auto-generated if empty; protects management UI)
     webui_token: str = ""
+    allow_anonymous_chat: bool = False
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -146,17 +147,25 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         ("gitlab", "base_url"): "GITLAB_BASE_URL",
         ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
         ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
+        ("server", "allow_anonymous_chat"): "ALLOW_ANONYMOUS_CHAT",
+        ("pool", "webui_token"): "WEBUI_TOKEN",
     }
     for (section, key), env_var in env_map.items():
         val = os.environ.get(env_var)
         if val is not None:
+            cfg_dict.setdefault(section, {})
             if key == "port":
                 val = int(val)
+            elif key == "allow_anonymous_chat":
+                val = str(val).lower() in ("1", "true", "yes", "on")
             cfg_dict[section][key] = val
 
     sc = cfg_dict["server"]
     gc = cfg_dict["gitlab"]
     pool = cfg_dict.get("pool", {})
+    allow_anonymous = sc.get("allow_anonymous_chat", False)
+    if isinstance(allow_anonymous, str):
+        allow_anonymous = allow_anonymous.lower() in ("1", "true", "yes", "on")
     return AppConfig(
         host=sc.get("host", "0.0.0.0"),
         port=sc.get("port", 8080),
@@ -178,6 +187,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         pool_retry_count=pool.get("retry_count", 3),
         pool_invalid_on_auth_error=pool.get("invalid_on_auth_error", True),
         webui_token=pool.get("webui_token", "") or cfg_dict.get("webui_token", ""),
+        allow_anonymous_chat=bool(allow_anonymous),
     )
 
 
@@ -193,6 +203,17 @@ class ChatMessage(BaseModel):
     tool_call_id: Optional[str] = None
 
 
+class ChatCompletionToolFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class ChatCompletionTool(BaseModel):
+    type: str = "function"
+    function: ChatCompletionToolFunction
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: List[ChatMessage] = Field(..., description="Chat messages")
@@ -204,6 +225,9 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
     user: Optional[str] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
     conversation_id: Optional[str] = Field(
         default=None,
         description="Existing GitLab Workflow ID (gid://gitlab/Ai::DuoWorkflows::Workflow/xxx) to continue conversation"
@@ -249,6 +273,318 @@ class ModelInfo(BaseModel):
 class ModelListResponse(BaseModel):
     object: str = "list"
     data: List[ModelInfo] = []
+
+
+TOOL_CALL_SYSTEM_PROMPT = """
+You may call tools by returning only a JSON object with this exact shape:
+{"tool_calls":[{"name":"tool_name","arguments":{"arg":"value"}}]}
+
+Rules:
+- Use a tool only when it is necessary or explicitly requested.
+- Do not wrap the JSON in markdown.
+- Do not include explanatory text when calling tools.
+- If no tool is needed, answer normally.
+""".strip()
+
+
+def _is_placeholder_auth(value: str) -> bool:
+    stripped = (value or "").strip()
+    return stripped in ("", "_gitlab_session=YOUR_SESSION_HERE; _gitlab_session_random=...")
+
+
+def _tool_choice_is_none(tool_choice: Any) -> bool:
+    return isinstance(tool_choice, str) and tool_choice.lower() == "none"
+
+
+def _tools_enabled(req: ChatCompletionRequest) -> bool:
+    return bool(req.tools) and not _tool_choice_is_none(req.tool_choice)
+
+
+def _tool_to_dict(tool: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(tool, ChatCompletionTool):
+        return tool.model_dump(exclude_none=True)
+    if not isinstance(tool, dict):
+        return None
+
+    if isinstance(tool.get("function"), dict):
+        function = dict(tool["function"])
+        name = function.get("name")
+        if not name:
+            return None
+        return {
+            "type": tool.get("type", "function"),
+            "function": {
+                "name": name,
+                "description": function.get("description"),
+                "parameters": function.get("parameters") or {},
+            },
+        }
+
+    name = tool.get("name")
+    if name:
+        return {
+            "type": tool.get("type", "function"),
+            "function": {
+                "name": name,
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters") or {},
+            },
+        }
+    return None
+
+
+def _messages_for_upstream(req: ChatCompletionRequest) -> List[ChatMessage]:
+    if not _tools_enabled(req):
+        return req.messages
+
+    tools_payload = [t for t in (_tool_to_dict(t) for t in (req.tools or [])) if t]
+    tool_choice = req.tool_choice if req.tool_choice is not None else "auto"
+    instruction = (
+        f"{TOOL_CALL_SYSTEM_PROMPT}\n\n"
+        f"Available tools:\n{json.dumps(tools_payload, ensure_ascii=False)}\n\n"
+        f"tool_choice: {json.dumps(tool_choice, ensure_ascii=False)}\n"
+        f"parallel_tool_calls: {bool(req.parallel_tool_calls) if req.parallel_tool_calls is not None else True}"
+    )
+    return [ChatMessage(role="system", content=instruction), *req.messages]
+
+
+def _json_candidates(text: str) -> List[str]:
+    candidates: List[str] = []
+    stripped = (text or "").strip()
+    if not stripped:
+        return candidates
+    candidates.append(stripped)
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", stripped, flags=re.IGNORECASE | re.DOTALL):
+        candidates.append(match.group(1).strip())
+
+    start = stripped.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(stripped)):
+            ch = stripped[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(stripped[start:idx + 1])
+                        break
+        start = stripped.find("{", start + 1)
+    return candidates
+
+
+def _normalize_tool_calls(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict) and "tool_calls" in payload:
+        raw_calls = payload.get("tool_calls")
+    elif isinstance(payload, dict) and "tool_call" in payload:
+        raw_calls = [payload.get("tool_call")]
+    elif isinstance(payload, list):
+        raw_calls = payload
+    else:
+        return []
+
+    calls: List[Dict[str, Any]] = []
+    for raw in raw_calls or []:
+        if not isinstance(raw, dict):
+            continue
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+        name = fn.get("name")
+        if not name:
+            continue
+        args = fn.get("arguments", raw.get("arguments", {}))
+        if isinstance(args, str):
+            try:
+                parsed_args = json.loads(args)
+            except Exception:
+                parsed_args = args
+            args = parsed_args
+        arg_text = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False, separators=(",", ":"))
+        calls.append({
+            "id": raw.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": str(name),
+                "arguments": arg_text,
+            },
+        })
+    return calls
+
+
+def _parse_tool_calls(content: str) -> List[Dict[str, Any]]:
+    for candidate in _json_candidates(content):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        calls = _normalize_tool_calls(parsed)
+        if calls:
+            return calls
+    return []
+
+
+def _usage_for(messages: List[ChatMessage], content: str) -> UsageInfo:
+    prompt_chars = 0
+    for m in messages:
+        prompt_chars += len(m.content or "")
+        if m.tool_calls:
+            prompt_chars += len(json.dumps(m.tool_calls, ensure_ascii=False))
+    return UsageInfo(
+        prompt_tokens=prompt_chars // 4,
+        completion_tokens=len(content or "") // 4,
+        total_tokens=(prompt_chars + len(content or "")) // 4,
+    )
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    return value[:8] + "..." + value[-4:] if len(value) > 16 else "***"
+
+
+def _mask_account_row(acc: Dict[str, Any]) -> Dict[str, Any]:
+    masked = dict(acc)
+    masked["auth_value"] = _mask_secret(masked.get("auth_value", ""))
+    masked["cookie_value"] = _mask_secret(masked.get("cookie_value", ""))
+    return masked
+
+
+def _guess_auth_type(auth_value: str, fallback: str) -> str:
+    val = (auth_value or "").strip()
+    lower = val.lower()
+    if "_gitlab_session=" in lower or ("=" in val and ";" in val):
+        return "cookie"
+    if lower.startswith("oauth2") or lower.startswith("ya29."):
+        return "oauth"
+    if lower.startswith("glpat-"):
+        return "token"
+    return fallback
+
+
+async def _collect_sse_content(stream: AsyncGenerator[str, None]) -> str:
+    full_content: List[str] = []
+    async for chunk_str in stream:
+        if not chunk_str.startswith("data: ") or "[DONE]" in chunk_str:
+            continue
+        try:
+            data = json.loads(chunk_str[6:])
+            delta = data.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                full_content.append(content)
+        except (json.JSONDecodeError, IndexError):
+            pass
+    return "".join(full_content)
+
+
+async def _stream_response_with_tools(
+    stream: AsyncGenerator[str, None],
+    req: ChatCompletionRequest,
+    completion_id: str,
+    created_ts: int,
+    model: str,
+) -> AsyncGenerator[str, None]:
+    if not _tools_enabled(req):
+        async for chunk in stream:
+            yield chunk
+        return
+
+    content = await _collect_sse_content(stream)
+    tool_calls = _parse_tool_calls(content)
+    if not tool_calls:
+        role_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+        if content:
+            content_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+        yield _finish_stream(completion_id, created_ts, model, "stop")
+        yield "data: [DONE]\n\n"
+        return
+
+    role_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_ts,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+    for call in tool_calls:
+        yield _tool_call_stream(call, completion_id, created_ts, model)
+    yield _finish_stream(completion_id, created_ts, model, "tool_calls")
+    yield "data: [DONE]\n\n"
+
+
+def _tool_call_stream(call: Dict[str, Any], completion_id: str, created_ts: int, model: str) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_ts,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": call["id"],
+                "type": "function",
+                "function": call["function"],
+            }]},
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def _finish_stream(completion_id: str, created_ts: int, model: str, reason: str) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_ts,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
 
 
 # ============================================================
@@ -929,9 +1265,16 @@ class GitLabDuoClientV2:
             elif role == "USER":
                 parts.append(content)
             elif role == "ASSISTANT":
-                parts.append(f"[Previous Assistant Response]\n{content}")
+                if msg.tool_calls:
+                    parts.append(
+                        "[Previous Assistant Tool Calls]\n"
+                        + json.dumps(msg.tool_calls, ensure_ascii=False)
+                    )
+                if content:
+                    parts.append(f"[Previous Assistant Response]\n{content}")
             elif role == "TOOL":
-                parts.append(f"[Tool Result]\n{content}")
+                label = f"Tool Result: {msg.name or msg.tool_call_id}" if (msg.name or msg.tool_call_id) else "Tool Result"
+                parts.append(f"[{label}]\n{content}")
         return "\n\n".join(parts)
 
 
@@ -1128,9 +1471,13 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
         user_id = db_key["user_id"]
         dm.report_key_usage(api_key_raw)
 
+    if not authorization and not config.allow_anonymous_chat:
+        raise HTTPException(status_code=401, detail="Authorization required")
+
     model = req.model or config.default_model
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created_ts = int(time.time())
+    upstream_messages = _messages_for_upstream(req)
 
     # Decide auth source:
     #   1. Per-request Authorization (non-API-key, non-JWT) → use it directly
@@ -1163,7 +1510,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
             last_error = "No available account"
             # 把多轮 messages 合并成单个 prompt（Duo Chat UI 单消息发送）
             prompt_parts = []
-            for m in req.messages:
+            for m in upstream_messages:
                 role = m.role.upper()
                 c = m.content or ""
                 if role == "SYSTEM":
@@ -1171,7 +1518,16 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                 elif role == "USER":
                     prompt_parts.append(c)
                 elif role == "ASSISTANT":
-                    prompt_parts.append(f"[Assistant]\n{c}")
+                    if m.tool_calls:
+                        prompt_parts.append(
+                            "[Assistant Tool Calls]\n"
+                            + json.dumps(m.tool_calls, ensure_ascii=False)
+                        )
+                    if c:
+                        prompt_parts.append(f"[Assistant]\n{c}")
+                elif role == "TOOL":
+                    label = f"Tool Result: {m.name or m.tool_call_id}" if (m.name or m.tool_call_id) else "Tool Result"
+                    prompt_parts.append(f"[{label}]\n{c}")
             prompt = "\n\n".join(prompt_parts)
 
             for attempt in range(max(1, config.pool_retry_count)):
@@ -1192,7 +1548,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                     except Exception as e:
                         last_error = f"创建浏览器会话失败: {e}"
                         logging.warning("[Pool] temp session create failed: %s", e)
-                        await pool.report_failure(account.id, last_error)
+                        await user_pool.report_failure(account.id, last_error)
                         continue
                     # 用账号 cookie 覆盖 (PAT账户用 cookie_value, cookie账户用 auth_value)
                     from urllib.parse import urlparse as _up
@@ -1257,7 +1613,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
 
         if req.stream:
             return StreamingResponse(
-                pool_stream(),
+                _stream_response_with_tools(pool_stream(), req, completion_id, created_ts, model),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1278,34 +1634,40 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                     except (json.JSONDecodeError, IndexError):
                         pass
             content = "".join(full_content)
+            tool_calls = _parse_tool_calls(content) if _tools_enabled(req) else []
             response = ChatCompletionResponse(
                 id=completion_id, object="chat.completion", created=created_ts, model=model,
                 choices=[ChatCompletionChoice(index=0,
-                    message=ChoiceMessage(role="assistant", content=content),
-                    finish_reason="stop" if content else "error")],
-                usage=UsageInfo(
-                    prompt_tokens=sum(len(m.content or "") // 4 for m in req.messages),
-                    completion_tokens=len(content) // 4,
-                    total_tokens=sum(len(m.content or "") // 4 for m in req.messages) + len(content) // 4,
-                ),
+                    message=ChoiceMessage(
+                        role="assistant",
+                        content=None if tool_calls else content,
+                        tool_calls=tool_calls or None,
+                    ),
+                    finish_reason="tool_calls" if tool_calls else ("stop" if content else "error"))],
+                usage=_usage_for(req.messages, content),
             )
             return JSONResponse(content=json.loads(response.model_dump_json()))
 
     # ---- Non-pool path (per-request auth or config fallback) ----
     active_client = client
     if req_auth:
-        active_client = GitLabDuoClientV2(replace(config, auth_value=req_auth))
+        active_client = GitLabDuoClientV2(replace(
+            config,
+            auth_value=req_auth,
+            auth_type=_guess_auth_type(req_auth, config.auth_type),
+        ))
 
     if req.stream:
         async def generate():
-            async for chunk in active_client.stream_chat(
-                messages=req.messages,
+            stream = active_client.stream_chat(
+                messages=upstream_messages,
                 model_name=model,
                 conversation_id=req.conversation_id,
                 override_auth=req_auth,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
-            ):
+            )
+            async for chunk in _stream_response_with_tools(stream, req, completion_id, created_ts, model):
                 yield chunk
 
         return StreamingResponse(
@@ -1321,7 +1683,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
         # Non-streaming: collect all chunks
         full_content = []
         async for chunk_str in active_client.stream_chat(
-            messages=req.messages,
+            messages=upstream_messages,
             model_name=model,
             conversation_id=req.conversation_id,
             override_auth=req_auth,
@@ -1337,6 +1699,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                     pass
 
         content = "".join(full_content)
+        tool_calls = _parse_tool_calls(content) if _tools_enabled(req) else []
         response = ChatCompletionResponse(
             id=completion_id,
             object="chat.completion",
@@ -1344,14 +1707,14 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
             model=model,
             choices=[ChatCompletionChoice(
                 index=0,
-                message=ChoiceMessage(role="assistant", content=content),
-                finish_reason="stop",
+                message=ChoiceMessage(
+                    role="assistant",
+                    content=None if tool_calls else content,
+                    tool_calls=tool_calls or None,
+                ),
+                finish_reason="tool_calls" if tool_calls else "stop",
             )],
-            usage=UsageInfo(
-                prompt_tokens=sum(len(m.content or "") // 4 for m in req.messages),
-                completion_tokens=len(content) // 4,
-                total_tokens=sum(len(m.content or "") // 4 for m in req.messages) + len(content) // 4,
-            ),
+            usage=_usage_for(req.messages, content),
         )
         return JSONResponse(content=json.loads(response.model_dump_json()))
 
@@ -1359,6 +1722,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
 @app.post("/v1/accounts/switch")
 async def switch_account(request: Request):
     global config, client
+    await _require_webui(request)
     body = await request.json()
     auth_type = body.get("auth_type", "cookie")
     auth_value = body.get("auth_value", "")
@@ -1377,7 +1741,8 @@ async def switch_account(request: Request):
 
 
 @app.get("/v1/accounts/info")
-async def account_info():
+async def account_info(request: Request):
+    await _require_webui(request)
     if not config:
         raise HTTPException(status_code=503, detail="Service not initialized")
     val = config.auth_value
@@ -1425,6 +1790,17 @@ async def _get_user_or_webui(request: Request) -> Optional[dict]:
     if _check_webui_token(request):
         return None
     raise HTTPException(status_code=401, detail="Invalid or missing auth")
+
+
+async def _require_webui_or_admin(request: Request) -> Optional[dict]:
+    if _check_webui_token(request):
+        return None
+    auth = request.headers.get("authorization") or ""
+    if auth.startswith("Bearer ") and dm:
+        user = dm.verify_token(auth[7:])
+        if user and user.get("role") == "admin":
+            return user
+    raise HTTPException(status_code=403, detail="admin required")
 
 
 @app.get("/v1/accounts/pool")
@@ -1838,7 +2214,7 @@ def _save_local_commit(h: str):
 @app.get("/v1/system/update/check")
 async def check_update(request: Request):
     """比较本地与 GitHub 最新 commit。"""
-    await _require_webui(request)
+    await _require_webui_or_admin(request)
     local = _read_local_commit()
     try:
         async with httpx.AsyncClient(timeout=15) as cl:
@@ -1866,7 +2242,7 @@ async def check_update(request: Request):
 @app.post("/v1/system/update/do")
 async def do_update(request: Request):
     """Git pull + systemctl restart。"""
-    await _require_webui(request)
+    await _require_webui_or_admin(request)
     import subprocess, os
     proj_dir = str(Path(__file__).parent)
     try:
@@ -1902,6 +2278,9 @@ class ResponsesRequest(BaseModel):
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
 
 
 @app.post("/v1/responses")
@@ -1918,7 +2297,7 @@ async def responses_endpoint(req: ResponsesRequest, authorization: Optional[str]
             if isinstance(item, dict):
                 messages.append(ChatMessage(
                     role=item.get("role", "user"),
-                    content=item.get("content", "")
+                    content=_content_to_text(item.get("content", item.get("text", "")))
                 ))
             elif isinstance(item, str):
                 messages.append(ChatMessage(role="user", content=item))
@@ -1931,6 +2310,9 @@ async def responses_endpoint(req: ResponsesRequest, authorization: Optional[str]
         temperature=req.temperature,
         max_tokens=req.max_output_tokens,
         top_p=req.top_p,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_tool_calls=req.parallel_tool_calls,
     )
     return await chat_completions(chat_req, authorization)
 
@@ -2030,13 +2412,15 @@ async def user_accounts_add(request: Request, authorization: Optional[str] = Hea
     auth_value = (body.get("auth_value") or "").strip()
     if not name or not auth_value:
         raise HTTPException(400, "name and auth_value required")
+    if auth_type not in ("cookie", "token", "pat", "session", "oauth"):
+        raise HTTPException(400, "invalid auth_type")
     cookie_value = (body.get("cookie_value") or "").strip()
     acc = dm.create_account(user["id"], name, auth_type, auth_value, body.get("note", ""), cookie_value=cookie_value)
     # 同步保存到账号池 (accounts.json)，供聊天引擎使用
     if pool and (auth_type in ("cookie", "pat")):
         await pool.add(name=name, auth_type=auth_type, auth_value=auth_value,
                        note=body.get("note", ""), cookie_value=cookie_value)
-    return {"status": "ok", "account": acc}
+    return {"status": "ok", "account": _mask_account_row(acc)}
 
 
 @app.put("/v1/user/accounts/{aid}")
@@ -2049,11 +2433,15 @@ async def user_accounts_update(aid: str, request: Request, authorization: Option
             fields[k] = body[k]
     if not fields:
         raise HTTPException(400, "no fields to update")
-    acc = dm.update_account(aid, **fields)
+    if "auth_type" in fields and fields["auth_type"] not in ("cookie", "token", "pat", "session", "oauth"):
+        raise HTTPException(400, "invalid auth_type")
+    if "status" in fields and fields["status"] not in ("active", "cooldown", "disabled", "invalid"):
+        raise HTTPException(400, "invalid status")
+    acc = dm.update_user_account(user["id"], aid, **fields)
     if not acc:
         raise HTTPException(404)
     invalidate_user_pool(user["id"])
-    return {"status": "ok", "account": acc}
+    return {"status": "ok", "account": _mask_account_row(acc)}
 
 
 @app.post("/v1/user/accounts/verify")
@@ -2067,7 +2455,7 @@ async def user_accounts_verify(request: Request, authorization: Optional[str] = 
         raise HTTPException(400, "auth_value required")
     try:
         if auth_type == "pat":
-            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+            async with httpx.AsyncClient(timeout=15) as cl:
                 r = await cl.get(config.gitlab_base_url + "/api/v4/user",
                                  headers={"PRIVATE-TOKEN": auth_value})
                 if r.status_code == 200:
@@ -2075,7 +2463,7 @@ async def user_accounts_verify(request: Request, authorization: Optional[str] = 
                     return {"status": "ok", "message": f"有效 - {u['username']} (@{u.get('email','')})"}
                 raise HTTPException(400, f"PAT 无效 (HTTP {r.status_code})")
         else:
-            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+            async with httpx.AsyncClient(timeout=15) as cl:
                 r = await cl.get(config.gitlab_base_url + "/api/v4/user",
                                  headers={"Cookie": auth_value})
                 if r.status_code == 200:
@@ -2091,7 +2479,8 @@ async def user_accounts_verify(request: Request, authorization: Optional[str] = 
 @app.delete("/v1/user/accounts/{aid}")
 async def user_accounts_delete(aid: str, authorization: Optional[str] = Header(None)):
     user = await _get_user_from_auth(authorization)
-    dm.delete_account(aid)
+    if not dm.delete_user_account(user["id"], aid):
+        raise HTTPException(404)
     invalidate_user_pool(user["id"])
     return {"status": "ok", "deleted": aid}
 
@@ -2099,7 +2488,7 @@ async def user_accounts_delete(aid: str, authorization: Optional[str] = Header(N
 @app.get("/v1/user/api-keys")
 async def user_apikeys_list(authorization: Optional[str] = Header(None)):
     user = await _get_user_from_auth(authorization)
-    return {"keys": dm.list_api_keys(user["id"])}
+    return {"keys": dm.list_api_keys(user["id"]), "base_url": "/v1"}
 
 
 @app.post("/v1/user/api-keys")
@@ -2110,13 +2499,14 @@ async def user_apikeys_create(request: Request, authorization: Optional[str] = H
     if not name:
         raise HTTPException(400, "name required")
     raw, key_info = dm.create_api_key(user["id"], name)
-    return {"status": "ok", "key": raw, "key_info": key_info}
+    return {"status": "ok", "key": raw, "key_info": key_info, "base_url": "/v1"}
 
 
 @app.delete("/v1/user/api-keys/{kid}")
 async def user_apikeys_revoke(kid: str, authorization: Optional[str] = Header(None)):
-    await _get_user_from_auth(authorization)
-    dm.revoke_api_key(kid)
+    user = await _get_user_from_auth(authorization)
+    if not dm.revoke_user_api_key(user["id"], kid):
+        raise HTTPException(404)
     return {"status": "ok", "revoked": kid}
 
 
@@ -2237,4 +2627,3 @@ if __name__ == "__main__":
     import uvicorn
     cfg = load_config()
     uvicorn.run(app, host=cfg.host, port=cfg.port)
-

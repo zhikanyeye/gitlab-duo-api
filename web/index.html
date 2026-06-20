@@ -460,14 +460,14 @@
         <div class="panel">
           <div class="panel-head"><h2>接入示例</h2></div>
           <div class="panel-body" id="apiExample" style="font-size:13px;line-height:1.9;">
-            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">使用 OpenAI SDK 或任意兼容客户端，API 地址和密钥如下：</div>
-            <div style="background:var(--surface-3);border-radius:var(--radius-sm);padding:12px 16px;font-family:var(--mono);font-size:12px;overflow-x:auto;">
+<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">使用 OpenAI SDK 或任意兼容客户端，API 地址和密钥如下：</div>
+<div style="background:var(--surface-3);border-radius:var(--radius-sm);padding:12px 16px;font-family:var(--mono);font-size:12px;overflow-x:auto;">
 <div style="color:var(--text-faint);"># Base URL</div>
-<div>API_BASE = http://103.231.56.210:8088/v1</div>
+<div>API_BASE = <span class="apiBaseText">/v1</span></div>
 <div style="color:var(--text-faint);margin-top:8px;"># API Key (在此页面生成)</div>
 <div>API_KEY = sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</div>
 <div style="color:var(--text-faint);margin-top:8px;"># curl 示例</div>
-<div>curl <span id="exampleHost" style="color:var(--accent);">http://103.231.56.210:8088</span>/v1/chat/completions \</div>
+<div>curl <span class="apiBaseText" style="color:var(--accent);">/v1</span>/chat/completions \</div>
 <div>  -H "Authorization: Bearer $API_KEY" \</div>
 <div>  -H "Content-Type: application/json" \</div>
 <div>  -d '{"model":"claude-opus-4.8","messages":[{"role":"user","content":"hello"}]}'</div>
@@ -592,10 +592,17 @@
 <script>
 const API = '';  // same origin
 let TOKEN = localStorage.getItem('duo_jwt') || '';
-let ADMIN_TOKEN = 'duo-admin-2026';  // system-level for update check etc
 let currentView = 'accounts';
 let currentUser = null;
 let models = [];
+
+function getApiBaseUrl() {
+  return location.origin + '/v1';
+}
+
+function refreshApiBaseLabels() {
+  document.querySelectorAll('.apiBaseText').forEach(el => { el.textContent = getApiBaseUrl(); });
+}
 
 /* ---------- Auth ---------- */
 function showRegister() {
@@ -663,6 +670,7 @@ function logout() { TOKEN = ''; localStorage.removeItem('duo_jwt'); location.rel
 function enterApp() {
   document.getElementById('loginView').classList.add('hidden');
   document.getElementById('appView').classList.remove('hidden');
+  refreshApiBaseLabels();
   // 显示用户名并判断管理员
   fetch('/v1/auth/me', {headers:{'Authorization':'Bearer '+TOKEN}}).then(r=>r.json()).then(u=>{
     currentUser = u;
@@ -1266,6 +1274,7 @@ async function genApiKey() {
   try {
     const r = await fetchJson('/v1/user/api-keys', { method:'POST', body: JSON.stringify({name}) });
     const key = r.key;
+    const baseUrl = location.origin + (r.base_url || '/v1');
     copyToClipboard(key);
     const msg = document.getElementById('modalRoot');
     msg.innerHTML = `<div class="modal-overlay" onclick="this.remove();event.stopPropagation();">
@@ -1274,7 +1283,8 @@ async function genApiKey() {
         <div class="modal-body">
           <div style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">已复制到剪贴板，请妥善保存，关闭后无法再次查看完整密钥。</div>
           <div style="background:var(--surface-3);border-radius:var(--radius-sm);padding:12px 14px;font-family:var(--mono);font-size:12.5px;word-break:break-all;user-select:all;">${esc(key)}</div>
-          <div style="margin-top:12px;font-size:12px;color:var(--text-muted);">用法：<br><code style="background:var(--surface-3);padding:2px 6px;border-radius:3px;">Authorization: Bearer ${esc(key)}</code></div>
+          <div style="margin-top:12px;font-size:12px;color:var(--text-muted);">Base URL：<br><code style="background:var(--surface-3);padding:2px 6px;border-radius:3px;">${esc(baseUrl)}</code></div>
+          <div style="margin-top:8px;font-size:12px;color:var(--text-muted);">API Key：<br><code style="background:var(--surface-3);padding:2px 6px;border-radius:3px;">${esc(key)}</code></div>
         </div>
         <div class="modal-foot"><button class="btn btn-primary" onclick="document.getElementById('modalRoot').innerHTML='';refreshApiKeys();">我已保存</button></div>
       </div></div>`;

@@ -6,6 +6,8 @@ server:
   # 8080 被其他 Docker 服务占用，改用 8088
   port: 8088
   debug: false
+  # 默认要求 Authorization；如需兼容匿名本地调用，可用环境变量 ALLOW_ANONYMOUS_CHAT=true 显式开启
+  allow_anonymous_chat: false
 
 gitlab:
   # GitLab 实例地址 (支持 gitlab.com 和私有化部署)
@@ -52,7 +54,7 @@ pool:
   # 认证错误(401/403)时直接标记账号为 invalid (而非仅冷却)
   invalid_on_auth_error: true
   # WebUI 管理令牌; 留空则启动时自动生成并打印到日志
-  webui_token: "duo-admin-2026"
+  webui_token: ""
 
 # ===== SMTP 邮箱配置 =====
 smtp:
@@ -60,7 +62,7 @@ smtp:
   port: 465
   user: "agcwhml2025@163.com"
   # 请替换为实际授权码/密码；也可通过环境变量 SMTP_PASS 设置
-  password: "SGpCG4bFp7VwKBaA"
+  password: ""
   sender: "agcwhml2025@163.com"
   timeout: 15
 

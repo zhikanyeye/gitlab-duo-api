@@ -169,6 +169,7 @@ class AccountPool:
                 name=row["name"],
                 auth_type=row["auth_type"],
                 auth_value=row["auth_value"],
+                cookie_value=row.get("cookie_value") or "",
                 enabled=bool(row["enabled"]),
                 status=row.get("status") or "active",
                 cooldown_until=float(row.get("cooldown_until") or 0),
@@ -229,7 +230,7 @@ class AccountPool:
                 enabled=enabled,
             )
             self._accounts[acc.id] = acc
-            self._write_unlocked()
+            await self._write_unlocked()
             return acc
 
     async def update(self, account_id: str, **fields) -> Optional[Account]:
@@ -245,14 +246,14 @@ class AccountPool:
                 if acc.status == "invalid":
                     acc.status = "active"
                 acc.stats.consecutive_failures = 0
-            self._write_unlocked()
+            await self._write_unlocked()
             return acc
 
     async def delete(self, account_id: str) -> bool:
         async with self._lock:
             if account_id in self._accounts:
                 del self._accounts[account_id]
-                self._write_unlocked()
+                await self._write_unlocked()
                 return True
             return False
 
@@ -274,7 +275,7 @@ class AccountPool:
                 acc.status = "active"
             elif not enabled:
                 acc.status = "disabled"
-            self._write_unlocked()
+            await self._write_unlocked()
             return acc
 
     async def reset_status(self, account_id: str) -> Optional[Account]:
@@ -286,7 +287,7 @@ class AccountPool:
             acc.cooldown_until = 0.0
             acc.stats.consecutive_failures = 0
             acc.enabled = True
-            self._write_unlocked()
+            await self._write_unlocked()
             return acc
 
     # ---------------- Scheduling ----------------
@@ -360,7 +361,7 @@ class AccountPool:
                 acc.cooldown_until = 0.0
             if acc.in_flight > 0:
                 acc.in_flight -= 1
-            self._write_unlocked()
+            await self._write_unlocked()
 
     async def report_failure(self, account_id: str, error: str) -> None:
         async with self._lock:
@@ -389,7 +390,7 @@ class AccountPool:
                 acc.cooldown_until = now + self.cooldown_seconds
                 logger.warning("Account %s COOLDOWN after %d failures",
                                acc.name, acc.stats.consecutive_failures)
-            self._write_unlocked()
+            await self._write_unlocked()
 
     # ---------------- Pool-level config ----------------
 
@@ -397,7 +398,7 @@ class AccountPool:
         async with self._lock:
             if strategy in SCHEDULE_STRATEGIES:
                 self.strategy = strategy
-                self._write_unlocked()
+                await self._write_unlocked()
             return self.strategy
 
     async def set_config(self, cooldown_seconds: Optional[int] = None,
@@ -410,7 +411,7 @@ class AccountPool:
                 self.max_consecutive_failures = max_consecutive_failures
             if invalid_on_auth_error is not None:
                 self.invalid_on_auth_error = invalid_on_auth_error
-            self._write_unlocked()
+            await self._write_unlocked()
 
     async def get_config(self) -> Dict:
         async with self._lock:

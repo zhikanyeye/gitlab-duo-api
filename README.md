@@ -9,6 +9,7 @@
 - **浏览器辅助登录** — WebUI 内置 Playwright 浏览器串流，登录 GitLab 后自动抓取 Cookie
 - **API 密钥** — 生成 `sk-` 格式密钥，方便第三方客户端接入
 - **流式响应** — SSE 格式，完整兼容 OpenAI SDK
+- **工具调用** — 兼容 OpenAI `tools` / `tool_choice` 协议，支持 Chat Completions 与 Responses API
 - **Claude 风格 WebUI** — 暖白底+珊瑚橙，账号管理、对话测试、密钥管理一站式
 - **多模型** — Claude Opus 4.8 / Sonnet 4 / Haiku 3.5 / GPT-5.5 等
 
@@ -67,11 +68,13 @@ systemctl enable --now gitlab-duo-api
 ```yaml
 server:
   port: 8088
+  allow_anonymous_chat: false
 
 pool:
   enabled: true
   strategy: round_robin
-  webui_token: "your-admin-token"
+  # 建议生产环境用 WEBUI_TOKEN 环境变量设置
+  webui_token: ""
 
 models:
   claude-opus-4.8:
@@ -95,6 +98,14 @@ WebUI → 「API 密钥」→ 生成 → 复制密钥。
 
 ### 3. 接入客户端
 
+Base URL 固定为服务地址加 `/v1`：
+
+```text
+http://your-server:8088/v1
+```
+
+API Key 在 WebUI 的「API 密钥」页面生成，格式为 `sk-...`。
+
 ```bash
 # curl
 curl http://your-server:8088/v1/chat/completions \
@@ -107,6 +118,32 @@ from openai import OpenAI
 client = OpenAI(base_url="http://your-server:8088/v1", api_key="sk-xxxxxxxx")
 client.chat.completions.create(model="claude-opus-4.8", messages=[{"role":"user","content":"hello"}])
 ```
+
+### 工具调用
+
+工具调用采用 OpenAI 兼容协议。由于上游 GitLab Duo 不是原生 function calling，代理会把工具定义注入提示，并解析模型返回的 JSON：
+
+```python
+client.chat.completions.create(
+    model="claude-sonnet-4",
+    messages=[{"role": "user", "content": "查一下上海天气"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather by city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+    tool_choice="auto",
+)
+```
+
+`/v1/responses` 也支持扁平工具格式，例如 `{"type":"function","name":"get_weather","parameters":{...}}`。
 
 ### 4. 对话测试
 
