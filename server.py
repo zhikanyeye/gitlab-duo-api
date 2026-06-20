@@ -1357,6 +1357,37 @@ async def startup():
     dm = DataManager(db)
     logging.info("[db] SQLite initialized at %s", DB_PATH)
 
+    # Bootstrap an admin user for first deployment or SMTP-less recovery.
+    admin_username = (
+        os.environ.get("ADMIN_USERNAME")
+        or os.environ.get("DUO_ADMIN_USERNAME")
+        or ""
+    ).strip()
+    admin_password = (
+        os.environ.get("ADMIN_PASSWORD")
+        or os.environ.get("DUO_ADMIN_PASSWORD")
+        or ""
+    ).strip()
+    reset_admin_password = (
+        os.environ.get("ADMIN_RESET_PASSWORD", "").lower()
+        in ("1", "true", "yes", "on")
+    )
+    if admin_username or admin_password:
+        if not admin_username or len(admin_password) < 6:
+            logging.warning("[db] ADMIN_USERNAME and ADMIN_PASSWORD(min 6 chars) are both required for admin bootstrap")
+        else:
+            existing_admin = dm.get_user_by_username(admin_username)
+            if existing_admin:
+                if existing_admin.get("role") != "admin":
+                    dm.update_user_role(existing_admin["id"], "admin")
+                if reset_admin_password:
+                    dm.update_user_password(existing_admin["id"], admin_password)
+                    logging.info("[db] reset bootstrap admin password for '%s'", admin_username)
+                logging.info("[db] bootstrap admin '%s' already exists", admin_username)
+            else:
+                dm.create_user(admin_username, admin_password, role="admin")
+                logging.info("[db] created bootstrap admin '%s'", admin_username)
+
     # Ensure at least one admin exists
     if not dm.has_admin():
         first = dm.get_first_user()
@@ -2196,7 +2227,7 @@ async def api_keys_rename(key_id: str, request: Request):
 # GitHub 更新检测
 # ============================================================
 
-GITHUB_REPO = "djfuni/gitlab-duo-api"
+GITHUB_REPO = "zhikanyeye/gitlab-duo-api"
 LOCAL_COMMIT_FILE = Path(__file__).parent / ".commit_hash"
 
 

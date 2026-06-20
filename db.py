@@ -243,12 +243,17 @@ class DataManager:
         self.db.commit()
         return True
 
-    def reset_user_password(self, uid: str, password: str) -> bool:
+    def update_user_password(self, uid: str, password: str) -> bool:
         if len(password) < 6:
             return False
         self.db.execute("UPDATE users SET password_hash=? WHERE id=?", hash_password(password), uid)
         self.db.commit()
         return True
+
+    def reset_user_password(self, uid: str, password: str) -> bool:
+        if len(password) < 6:
+            return False
+        return self.update_user_password(uid, password)
 
     def login(self, username: str, password: str) -> Optional[str]:
         user = self.get_user_by_username(username)

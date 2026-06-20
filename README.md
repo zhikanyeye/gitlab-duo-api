@@ -83,6 +83,21 @@ models:
   # ... 更多模型
 ```
 
+首次部署如果 SMTP 不通，可以直接用环境变量创建管理员账号：
+
+```bash
+ADMIN_USERNAME=admin \
+ADMIN_PASSWORD='change-this-password' \
+WEBUI_TOKEN='change-this-token' \
+JWT_SECRET='change-this-long-random-secret' \
+GITLAB_PROXY_PORT=8088 \
+venv/bin/python server.py
+```
+
+如果同名用户已存在并需要重置密码，额外设置 `ADMIN_RESET_PASSWORD=true`。
+
+邮箱验证码注册依赖 SMTP；云服务器若无法连通 `smtp.163.com:465`，请检查安全组/防火墙/邮件服务商限制，或先使用上面的管理员引导方式登录。
+
 ## 使用
 
 ### 1. 添加 GitLab 账号
