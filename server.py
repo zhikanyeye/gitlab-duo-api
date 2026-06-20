@@ -1591,6 +1591,36 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                     break
                 tried.append(account.id)
 
+                direct_auth_type = account.auth_type
+                if direct_auth_type == "pat":
+                    direct_auth_type = "token"
+                if direct_auth_type in ("cookie", "token", "session", "oauth"):
+                    direct_client = GitLabDuoClientV2(replace(
+                        config,
+                        auth_type=direct_auth_type,
+                        auth_value=account.auth_value,
+                    ))
+                    streamed_any = False
+                    try:
+                        logging.info("[Pool] trying direct GraphQL chat for account '%s'", account.name)
+                        async for chunk in direct_client.stream_chat(
+                            messages=upstream_messages,
+                            model_name=model,
+                            conversation_id=req.conversation_id,
+                            raise_on_send_error=True,
+                        ):
+                            streamed_any = True
+                            yield chunk
+                        await user_pool.report_success(account.id)
+                        return
+                    except Exception as e:
+                        last_error = f"direct GraphQL chat failed: {e}"
+                        logging.warning("[Pool] direct GraphQL chat failed for account '%s': %s", account.name, e)
+                        if streamed_any:
+                            await user_pool.report_failure(account.id, last_error)
+                            yield "data: [DONE]\n\n"
+                            return
+
                 # 优先复用 pinned 会话，否则用 cookie 创建临时浏览器会话
                 sess = login_mgr.get_pinned(account.id) if login_mgr else None
                 is_tmp = False
