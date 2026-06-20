@@ -1467,6 +1467,30 @@ async def list_models():
     return ModelListResponse(data=models)
 
 
+@app.get("/v1/chat/completions")
+async def chat_completions_get_hint():
+    return JSONResponse(
+        status_code=405,
+        content={
+            "detail": "Use POST /v1/chat/completions. If this happened from the WebUI, check that HTTPS/Nginx is not converting POST to GET.",
+        },
+        headers={"Allow": "POST"},
+    )
+
+
+@app.options("/v1/chat/completions")
+async def chat_completions_options():
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Allow": "POST, OPTIONS",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+        },
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, authorization: Optional[str] = Header(None)):
     if not config or not client:

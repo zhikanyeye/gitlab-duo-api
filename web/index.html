@@ -1019,7 +1019,8 @@ async function sendChat() {
       body: JSON.stringify({ model, messages:[{role:'user',content:text}], stream }),
     });
     if (!res.ok) {
-      const t = await res.text(); throw new Error(t.slice(0,200));
+      const t = await res.text();
+      throw new Error(`POST /v1/chat/completions -> HTTP ${res.status}: ${t.slice(0,200)}`);
     }
     if (stream && res.body) {
       const reader = res.body.getReader(); const dec = new TextDecoder();
