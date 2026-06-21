@@ -802,6 +802,40 @@ class GitLabDuoClientV2:
     }
     """
 
+    MUTATION_AI_ACTION_CHAT = """
+    mutation aiActionChat($input: AiActionInput!) {
+      aiAction(input: $input) {
+        errors
+        requestId
+        threadId
+        __typename
+      }
+    }
+    """
+
+    QUERY_INTROSPECT_AI_CHAT_TYPES = """
+    query introspectAiChatTypes {
+      aiActionInput: __type(name: "AiActionInput") {
+        inputFields {
+          name
+          type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+        }
+      }
+      aiAgenticChatInput: __type(name: "AiAgenticChatInput") {
+        inputFields {
+          name
+          type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+        }
+      }
+      aiActionPayload: __type(name: "AiActionPayload") {
+        fields {
+          name
+          type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+        }
+      }
+    }
+    """
+
     SUBSCRIPTION_AI_RESPONSE = """
     subscription aiMessageResponse($chatId: ID!, $requestId: String!) {
       aiMessageResponse(chatId: $chatId, requestId: $requestId) {
@@ -876,6 +910,75 @@ class GitLabDuoClientV2:
             logging.debug(err)
             return None, err
 
+    def _format_graphql_type_ref(self, type_ref: Optional[Dict[str, Any]]) -> str:
+        if not type_ref:
+            return "Unknown"
+        kind = type_ref.get("kind")
+        name = type_ref.get("name")
+        inner = type_ref.get("ofType")
+        if kind == "NON_NULL":
+            return f"{self._format_graphql_type_ref(inner)}!"
+        if kind == "LIST":
+            return f"[{self._format_graphql_type_ref(inner)}]"
+        return name or kind or "Unknown"
+
+    async def _introspect_ai_chat_schema(self, override_auth: Optional[str] = None) -> str:
+        try:
+            result = await self._graphql_request(
+                operation_name="introspectAiChatTypes",
+                query=self.QUERY_INTROSPECT_AI_CHAT_TYPES,
+                variables={},
+                override_auth=override_auth,
+            )
+        except Exception as e:
+            return f"schema introspection failed: {e}"
+
+        data = result.get("data", {}) or {}
+        parts: List[str] = []
+        for type_key, label, field_key in (
+            ("aiActionInput", "AiActionInput", "inputFields"),
+            ("aiAgenticChatInput", "AiAgenticChatInput", "inputFields"),
+            ("aiActionPayload", "AiActionPayload", "fields"),
+        ):
+            type_data = data.get(type_key)
+            if not type_data:
+                parts.append(f"{label}: <not found>")
+                continue
+            fields = type_data.get(field_key) or []
+            if not fields:
+                parts.append(f"{label}: <no fields>")
+                continue
+            rendered = ", ".join(
+                f"{f.get('name')}: {self._format_graphql_type_ref(f.get('type'))}"
+                for f in fields
+            )
+            parts.append(f"{label}: {rendered}")
+        return "schema: " + " | ".join(parts)
+
+    def _build_agentic_chat_payloads(
+        self,
+        prompt: str,
+        conversation_id: Optional[str],
+        resource: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        referer_url = resource or f"{self.base_url}/dashboard/home"
+        chat_payload: Dict[str, Any] = {
+            "content": prompt,
+            "refererUrl": referer_url,
+            "withCleanHistory": False,
+        }
+        if conversation_id:
+            chat_payload["clientSubscriptionId"] = conversation_id
+
+        # GitLab has renamed this wrapper in recent schemas. Try the likely
+        # wrappers around AiAgenticChatInput before falling back to older APIs.
+        return [
+            {"chat": chat_payload},
+            {"agenticChat": chat_payload},
+            {"aiAgenticChat": chat_payload},
+            {"duoChat": chat_payload},
+        ]
+
     async def send_message_to_workflow(
         self,
         prompt: str,
@@ -890,6 +993,7 @@ class GitLabDuoClientV2:
         尝试多种 mutation 方式以兼容不同版本的 GitLab
         """
         strategy_errors: List[str] = []
+        resource = kwargs.get("resource")
 
         # Strategy 1: Try sendDuoChatMessage mutation (preferred for newer GitLab)
         try:
@@ -917,7 +1021,33 @@ class GitLabDuoClientV2:
             strategy_errors.append(f"sendDuoChatMessage: {e}")
             logging.debug(f"sendDuoChatMessage failed: {e}")
 
-        # Strategy 2: Try aiAction mutation (fallback)
+        # Strategy 2: Try current aiAction chat mutation shape.
+        for input_payload in self._build_agentic_chat_payloads(prompt, conversation_id, resource):
+            wrapper_name = next(iter(input_payload.keys()))
+            try:
+                result = await self._graphql_request(
+                    operation_name="aiActionChat",
+                    query=self.MUTATION_AI_ACTION_CHAT,
+                    variables={"input": input_payload},
+                    override_auth=override_auth,
+                )
+                data = result.get("data", {}).get("aiAction", {}) or {}
+                errors = data.get("errors") or []
+                if errors:
+                    raise Exception("; ".join(map(str, errors)))
+                if data.get("requestId"):
+                    return {
+                        "request_id": data["requestId"],
+                        "chat_id": data.get("threadId") or conversation_id,
+                        "thread_id": data.get("threadId"),
+                        "method": f"aiActionChat.{wrapper_name}",
+                    }
+                raise Exception(f"empty aiAction response: {data}")
+            except Exception as e:
+                strategy_errors.append(f"aiActionChat.{wrapper_name}: {e}")
+                logging.debug("aiActionChat.%s failed: %s", wrapper_name, e)
+
+        # Strategy 3: Try legacy aiAction mutation (fallback)
         try:
             result = await self._graphql_request(
                 operation_name="aiAction",
@@ -941,7 +1071,7 @@ class GitLabDuoClientV2:
             strategy_errors.append(f"aiAction: {e}")
             logging.debug(f"aiAction failed: {e}")
 
-        # Strategy 3: Create new workflow then poll
+        # Strategy 4: Create new workflow then poll
         try:
             result = await self._graphql_request(
                 operation_name="createDuoWorkflow",
@@ -967,6 +1097,7 @@ class GitLabDuoClientV2:
             strategy_errors.append(f"createDuoWorkflow: {e}")
             logging.debug(f"createDuoWorkflow failed: {e}")
 
+        strategy_errors.append(await self._introspect_ai_chat_schema(override_auth=override_auth))
         detail = " | ".join(strategy_errors) if strategy_errors else "no strategy returned a workflow id"
         raise Exception(f"All message sending strategies failed: {detail}")
 
